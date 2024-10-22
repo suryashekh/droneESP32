@@ -5,6 +5,11 @@
 #include "C:\Users\user\Documents\Arduino\libraries\MAVLink\common\mavlink.h"
 #include <chrono>
 #include <vector>
+#include <deque>
+#include <string>
+#include <queue>
+#include <map>
+
 
 
 #define DRONE_ID 1
@@ -13,19 +18,30 @@
 
 HardwareSerial pixhawkSerial(2);
 
+std::deque<std::string> statusMessages;
+const size_t MAX_STATUS_MESSAGES = 100;
+
+unsigned long lastReconnectAttempt = 0;
+const unsigned long RECONNECT_INTERVAL = 3000; // 5 seconds
 const unsigned long MAVLINK_TIMEOUT = 3000;
 const unsigned long TELEMETRY_INTERVAL = 1000;
 const unsigned long GPS_TIME_INTERVAL = 1000;
+const unsigned long STATUS_MESSAGE_INTERVAL = 1000;
+
+std::queue<mavlink_message_t> message_queue;
+const int MAX_QUEUE_SIZE = 20;
 
 // WiFi and MQTT settings
 const char* ssid = "TP-Link_5734";
 const char* password = "70628739";
 const char* mqtt_server = "192.168.0.18";
 const char* mqtt_command_topic = "drone/command";
+const char* mqtt_rtcm_topic = "drone/rtcm";
 char mqtt_status_topic[50];
 char mqtt_mission_topic[50];
 char mqtt_telemetry_topic[50];
 char mqtt_individual_command_topic[50];
+char mqtt_individual_status_topic[50];
 
 #define MQTT_MAX_PACKET_SIZE 2048
 
@@ -63,9 +79,38 @@ PubSubClient client(espClient);
 
 unsigned long lastTelemetryTime = 0;
 unsigned long lastGPSTime = 0;
+unsigned long lastStatusRequestTime = 0;
 
 mavlink_message_t msg;
 mavlink_status_t status;
+
+const std::map<uint8_t, const char*> flightModes = {
+    {0, "STABILIZE"},
+    {1, "ACRO"},
+    {2, "ALT_HOLD"},
+    {3, "AUTO"},
+    {4, "GUIDED"},
+    {5, "LOITER"},
+    {6, "RTL"},
+    {7, "CIRCLE"},
+    {9, "LAND"},
+    {11, "DRIFT"},
+    {13, "SPORT"},
+    {14, "FLIP"},
+    {15, "AUTOTUNE"},
+    {16, "POSHOLD"},
+    {17, "BRAKE"},
+    {18, "THROW"},
+    {19, "AVOID_ADSB"},
+    {20, "GUIDED_NOGPS"},
+    {21, "SMART_RTL"},
+    {22, "FLOWHOLD"},
+    {23, "FOLLOW"},
+    {24, "ZIGZAG"},
+    {25, "SYSTEMID"},
+    {26, "AUTOROTATE"},
+    {27, "AUTO_RTL"}
+};
 
 void setup() {
   Serial.begin(115200);
@@ -82,30 +127,48 @@ void setup() {
   snprintf(mqtt_mission_topic, sizeof(mqtt_mission_topic), "drone/%d/mission", DRONE_ID);
   snprintf(mqtt_telemetry_topic, sizeof(mqtt_telemetry_topic), "drone/%d/telemetry", DRONE_ID);
   snprintf(mqtt_individual_command_topic, sizeof(mqtt_individual_command_topic), "drone/%d/command", DRONE_ID);
+  snprintf(mqtt_individual_status_topic, sizeof(mqtt_individual_status_topic), "drone/%d/status_messages", DRONE_ID);
   
   Serial.println("ESP32 started. Waiting for MQTT commands.");
 }
 
 void loop() {
   if (!client.connected()) {
-    reconnect();
+    if (reconnect()) {
+      lastReconnectAttempt = 0;
+    }
   }
   client.loop();
   
   while (pixhawkSerial.available()) {
     uint8_t c = pixhawkSerial.read();
     if (mavlink_parse_char(MAVLINK_COMM_0, c, &msg, &status)) {
-      handle_mavlink_message(&msg);
+      if (message_queue.size() < MAX_QUEUE_SIZE) {
+        message_queue.push(msg);
+      }
     }
   }
+ // Process messages in the queue
+  while (!message_queue.empty()) {
+    mavlink_message_t current_msg = message_queue.front();
+    message_queue.pop();
+    handle_mavlink_message(&current_msg);
+  }
+
 
   executeMission();
 
   // Send telemetry data at regular intervals
   unsigned long currentTime = millis();
+ 
+  // if (currentTime - lastStatusRequestTime > STATUS_MESSAGE_INTERVAL) { 
+  //   requestStatusMessages();
+  //   lastStatusRequestTime = currentTime;
+  // }
   if (currentTime - lastTelemetryTime >= TELEMETRY_INTERVAL) {
     sendTelemetryData();
     lastTelemetryTime = currentTime;
+    // printDebugInfo();
   }
   currentTime = millis();
   if (currentTime - lastGPSTime >= GPS_TIME_INTERVAL) {
@@ -126,25 +189,38 @@ void setup_wifi() {
   Serial.println("IP address: " + WiFi.localIP().toString());
 }
 
-void reconnect() {
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    if (client.connect("ESP32Client")) {
-      Serial.println("connected");
-      client.subscribe(mqtt_command_topic);
-      client.subscribe(mqtt_mission_topic);
-      client.subscribe(mqtt_individual_command_topic);
-      publishStatus("connected");
-      Serial.println("Subscribed to topics: ");
-      Serial.println(mqtt_command_topic);
-      Serial.println(mqtt_mission_topic);
-      Serial.println(mqtt_individual_command_topic);
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      delay(5000);
-    }
+boolean reconnect() {
+  if (millis() - lastReconnectAttempt < RECONNECT_INTERVAL) {
+    return false;
+  }
+  
+  lastReconnectAttempt = millis();
+  Serial.print("Attempting MQTT connection...");
+  
+  // Create a unique client ID
+  String clientId = "ESP32Client_";
+  clientId += String(DRONE_ID);
+  clientId += "_";
+  clientId += String(random(0xffff), HEX);
+  
+  if (client.connect(clientId.c_str())) {
+    Serial.println("connected");
+    client.subscribe(mqtt_command_topic);
+    client.subscribe(mqtt_mission_topic);
+    client.subscribe(mqtt_individual_command_topic);
+    client.subscribe(mqtt_rtcm_topic);
+    publishStatus("connected");
+    Serial.println("Subscribed to topics: ");
+    Serial.println(mqtt_command_topic);
+    Serial.println(mqtt_mission_topic);
+    Serial.println(mqtt_individual_command_topic);
+    Serial.println(mqtt_rtcm_topic);
+    return true;
+  } else {
+    Serial.print("failed, rc=");
+    Serial.print(client.state());
+    Serial.println(" try again in 5 seconds");
+    return false;
   }
 }
 
@@ -228,6 +304,61 @@ void callback(char* topic, byte* payload, unsigned int length) {
         startMission(takeoffAltitude);
       }
     }
+  } else if (strcmp(topic, mqtt_rtcm_topic) == 0) {
+    JsonArray rtcmData = doc["data"].as<JsonArray>();
+    uint8_t buffer[2000];  // Increased to 2000 bytes
+    size_t dataLen = 0;
+    
+    if (rtcmData.size() > sizeof(buffer)) {
+        Serial.print("RTCM message too large: ");
+        Serial.println(rtcmData.size());
+        Serial.print("Maximum size supported: ");
+        Serial.println(sizeof(buffer));
+        return;
+    }
+    
+    for (JsonVariant v : rtcmData) {
+        buffer[dataLen++] = v.as<uint8_t>();
+    }
+    
+    // MAVLink GPS_RTCM_DATA has a maximum payload size limitation
+    const size_t MAX_CHUNK_SIZE = 180; // Maximum safe size for GPS_RTCM_DATA message
+    size_t chunks = (dataLen + MAX_CHUNK_SIZE - 1) / MAX_CHUNK_SIZE; // Calculate number of chunks needed
+    
+    Serial.print("RTCM data size: ");
+    Serial.print(dataLen);
+    Serial.print(" bytes, splitting into ");
+    Serial.print(chunks);
+    Serial.println(" chunks");
+    
+    for (size_t i = 0; i < dataLen; i += MAX_CHUNK_SIZE) {
+      mavlink_message_t msg;
+      uint8_t mavBuffer[MAVLINK_MAX_PACKET_LEN];
+      
+      size_t chunkSize = min(MAX_CHUNK_SIZE, dataLen - i);
+      
+      mavlink_msg_gps_rtcm_data_pack(SYSTEM_ID, COMPONENT_ID, &msg,
+          (chunks > 1) ? 1 : 0,  // Set flag if message is fragmented
+          chunkSize,             // Length of this chunk
+          &buffer[i]             // Pointer to start of this chunk
+      );
+      
+      uint16_t len = mavlink_msg_to_send_buffer(mavBuffer, &msg);
+      pixhawkSerial.write(mavBuffer, len);
+      
+      // Log chunk information
+      Serial.print("Sent chunk ");
+      Serial.print(i / MAX_CHUNK_SIZE + 1);
+      Serial.print(" of ");
+      Serial.print(chunks);
+      Serial.print(", size: ");
+      Serial.println(chunkSize);
+      
+      // Small delay between chunks to prevent buffer overflow
+      if (chunks > 1) {
+          delay(5);
+      }
+    }
   }
 }
 
@@ -253,9 +384,72 @@ void handle_mavlink_message(mavlink_message_t *msg) {
       mavlink_msg_sys_status_decode(msg, &sys_status);
       // Update battery status in telemetry data
       break;
+    case MAVLINK_MSG_ID_STATUSTEXT: {
+      mavlink_statustext_t statustext;
+      mavlink_msg_statustext_decode(msg, &statustext);
+      Serial.println(statustext.text);
+      addStatusMessage(statustext.text);
+      break;
+    }
     // Add more message handlers as needed
   }
 }
+
+
+// Helper function to format timestamp
+void formatTimestamp(char* buffer, size_t bufferSize, uint64_t timestamp_us) {
+    uint64_t timestamp_s = timestamp_us / 1000000; // Convert to seconds
+    uint32_t hours = (timestamp_s % 86400) / 3600;
+    uint32_t minutes = (timestamp_s % 3600) / 60;
+    uint32_t seconds = timestamp_s % 60;
+    
+    snprintf(buffer, bufferSize, "%02d:%02d:%02d", hours, minutes, seconds);
+}
+
+void printDebugInfo() {
+  static unsigned long lastDebugTime = 0;
+  if (millis() - lastDebugTime > 5000) { // Print every 5 seconds
+    Serial.println("Debug Info:");
+    Serial.print("Messages in queue: ");
+    Serial.println(message_queue.size());
+    Serial.print("Status messages stored: ");
+    Serial.println(statusMessages.size());
+    Serial.print("Last known armed state: ");
+    Serial.println(armed ? "ARMED" : "DISARMED");
+    lastDebugTime = millis();
+  }
+}
+
+// Add this new function to handle status messages
+void addStatusMessage(const char* message) {
+    char timestamp[20];
+    formatTimestamp(timestamp, sizeof(timestamp), getCurrentTimeUsLite());
+    
+    char fullMessage[256];
+    snprintf(fullMessage, sizeof(fullMessage), "%s: %s", timestamp, message);
+    
+    statusMessages.push_front(std::string(fullMessage));
+    if (statusMessages.size() > MAX_STATUS_MESSAGES) {
+        statusMessages.pop_back();
+    }
+    
+    char mqttMessage[300];
+    Serial.println("Status Message::");
+    Serial.println(fullMessage);
+    snprintf(mqttMessage, sizeof(mqttMessage), "{\"message\": \"%s\"}", fullMessage);
+    client.publish(mqtt_individual_status_topic, mqttMessage);
+}
+
+// Add this new function to request status messages
+void requestStatusMessages() {
+  mavlink_message_t msg;
+  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+
+  mavlink_msg_command_long_pack(SYSTEM_ID, COMPONENT_ID, &msg, 1, 1, MAV_CMD_REQUEST_MESSAGE, 0, MAVLINK_MSG_ID_STATUSTEXT, 0, 0, 0, 0, 0, 0);
+  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+  pixhawkSerial.write(buf, len);
+}
+
 
 void publishStatus(const char* status) {
   DynamicJsonDocument doc(256);
@@ -328,22 +522,20 @@ void sendTelemetryData() {
   }
 
   const char* mode_str = getFlightModeString(base_mode, custom_mode);
+
   DynamicJsonDocument doc(1024);
   doc["altitude"] = altitude;
   doc["battery"] = battery_voltage;
   doc["mode"] = mode_str;
-  
-  Serial.println("Telemetry data: ALTITUDE");
-  Serial.print(altitude);
-  Serial.println("Telemetry data: Battery Voltage");
-  Serial.print(battery_voltage);
-  Serial.println("Telemetry data: Mode");
-  Serial.print(mode_str);
+  // Serial.println("Telemetry data: ALTITUDE");
+  // Serial.print(altitude);
+  // Serial.println("Telemetry data: Battery Voltage");
+  // Serial.print(battery_voltage);
+  // Serial.println("Telemetry data: Mode");
+  // Serial.print(mode_str);
   
   if (timeInitialized) {
-    uint64_t time_since_last_gps = (uint64_t)(micros() - systemTimeAtLastGPSUpdate);
-    uint64_t estimated_current_time = last_gps_time_us + time_since_last_gps;
-    doc["timestamp"] = estimated_current_time;
+    doc["timestamp"] = getCurrentTimeUsLite();
   } else {
     doc["timestamp"] = "not_initialized";
   }
@@ -355,13 +547,14 @@ void sendTelemetryData() {
 
 const char* getFlightModeString(uint8_t base_mode, uint32_t custom_mode) {
   if (base_mode & MAV_MODE_FLAG_CUSTOM_MODE_ENABLED) {
-    switch (custom_mode) {
-      case STABILIZE_MODE: return "Stabilize";
-      case GUIDED_MODE: return "Guided";
-      case AUTO_MODE: return "Auto";
-      case LAND_MODE: return "Land";
-      default: return "Unknown";
+    const char* mode_str;
+    auto it = flightModes.find(custom_mode);
+    if (it != flightModes.end()) {
+        mode_str = it->second;
+    } else {
+        mode_str = "UNKNOWN";
     }
+    return mode_str;
   } else if (base_mode & MAV_MODE_FLAG_MANUAL_INPUT_ENABLED) {
     return "Manual";
   } else {
@@ -380,7 +573,7 @@ void handleMissionUpload(JsonDocument& doc) {
             float lon = waypoint["lon"];
             float alt = waypoint["alt"];
             uint32_t time = waypoint["time"];
-            mission.push_back({lat, lon, alt, time * 1000000ULL, false});  // Convert seconds to microseconds
+            mission.push_back({lat, lon, alt, time * 1000ULL, false});  // Convert milli to microseconds
         }
         missionStarted = false;
         currentWaypointIndex = 0;
@@ -484,21 +677,11 @@ void changeFlightMode(uint8_t mode) {
   pixhawkSerial.write(buf, len);
 
   const char* mode_str;
-  switch(mode) {
-    case STABILIZE_MODE:
-      mode_str = "stabilize";
-      break;
-    case GUIDED_MODE:
-      mode_str = "guided";
-      break;
-    case AUTO_MODE:
-      mode_str = "auto";
-      break;
-    case LAND_MODE:
-      mode_str = "land";
-      break;
-    default:
-      mode_str = "unknown";
+  auto it = flightModes.find(mode);
+  if (it != flightModes.end()) {
+      mode_str = it->second;
+  } else {
+      mode_str = "UNKNOWN";
   }
 
   char status_message[50];
@@ -555,6 +738,9 @@ uint64_t getCurrentTimeUs() {
 
 //Give absolute time without mavlink call, based on last gps call
 uint64_t getCurrentTimeUsLite() {
+  if (!timeInitialized) {
+      return (uint64_t)micros();
+  }
   uint64_t time_since_last_gps = (uint64_t)(micros() - systemTimeAtLastGPSUpdate);
   return last_gps_time_us + time_since_last_gps;
 }
@@ -601,7 +787,7 @@ void armDrone() {
   uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
   pixhawkSerial.write(buf, len);
 
-  publishStatus("armed");
+  publishStatus("Sent arm command");
   Serial.println("Sent arm command");
 }
 
@@ -614,7 +800,7 @@ void takeoff(float altitude) {
   uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
   pixhawkSerial.write(buf, len);
 
-  publishStatus("taking off");
+  publishStatus("Sent takeoff command");
   Serial.println("Sent takeoff command");
 }
 
@@ -627,7 +813,7 @@ void land() {
   
   uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
   pixhawkSerial.write(buf, len);
-
+  publishStatus("Sent land command");
   Serial.println("Sent land command");
 }
 
