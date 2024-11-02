@@ -9,12 +9,22 @@
 #include <string>
 #include <queue>
 #include <map>
+#include <FastLED.h>
 
 
-
-#define DRONE_ID 1
+#define DRONE_ID 2
 #define RX_PIN 16
-#define TX_PIN 17
+#define TX_PIN 18
+
+#define LED_PIN     13         // GPIO2 for ESP32
+#define NUM_LEDS    49        // Number of LEDs in your strip
+#define LED_TYPE    WS2812B
+#define COLOR_ORDER GRB
+#define BRIGHTNESS  255        // Default brightness (0-255)
+#define MAX_LIGHT_SEQUENCE 50
+
+// Add this with other global variable declarations
+CRGB leds[NUM_LEDS];
 
 HardwareSerial pixhawkSerial(2);
 
@@ -34,9 +44,9 @@ const int MAX_QUEUE_SIZE = 20;
 
 
 // WiFi and MQTT settings
-const char* ssid = "TP-Link_5734";
-const char* password = "70628739";
-const char* mqtt_server = "192.168.0.18";
+const char* ssid = "Tenda_BEB620";
+const char* password = "12345678";
+const char* mqtt_server = "192.168.2.50";
 const char* mqtt_command_topic = "drone/command";
 const char* mqtt_rtcm_topic = "drone/rtcm";
 char mqtt_status_topic[50];
@@ -78,17 +88,64 @@ struct MissionBuffer {
     unsigned long lastChunkTime;
 } missionBuffer = {nullptr, 0, 0, nullptr, 0, 0};
 
+// Structure for light sequence steps (keep this with other struct definitions)
+struct LightStep {
+    uint64_t time;  // Time in microseconds since mission start
+    uint8_t r;      // Red value (0-255)
+    uint8_t g;      // Green value (0-255)
+    uint8_t b;      // Blue value (0-255)
+    bool executed;  // Flag to track if this step has been executed
+};
+
+// Keep these global variables
+std::vector<LightStep> lightSequence;
+size_t currentLightIndex = 0;
+
 #define MAX_WAYPOINTS 150
 #define MAX_MISSION_SIZE (MAX_WAYPOINTS * sizeof(Waypoint))
 #define COMMAND_DOC_SIZE 2048    // Size for regular commands and RTCM
 #define CHUNK_DOC_SIZE 1024      // Size for parsing mission chunks
 #define MISSION_CHUNK_SIZE 512   // Size of each mission data chunk
+// Add these definitions at the top with other #defines
+// GPS Fix Type Definitions
+#define GPS_FIX_TYPE_NO_GPS     0   // No GPS connected
+#define GPS_FIX_TYPE_NO_FIX     1   // No position information
+#define GPS_FIX_TYPE_2D_FIX     2   // 2D position
+#define GPS_FIX_TYPE_3D_FIX     3   // 3D position
+#define GPS_FIX_TYPE_DGPS       4   // DGPS/SBAS aided
+#define GPS_FIX_TYPE_RTK_FLOAT  5   // RTK float
+#define GPS_FIX_TYPE_RTK_FIXED  6   // RTK fixed
+#define GPS_FIX_TYPE_STATIC     7   // Static fixed
+#define GPS_FIX_TYPE_PPP        8   // PPP solution
+
+
+
+// Add this global variable to store GPS fix type
+uint8_t current_gps_fix_type = GPS_FIX_TYPE_NO_GPS;
+
+// Add this helper function to convert fix type to string
+const char* getGPSFixTypeString(uint8_t fix_type) {
+    switch(fix_type) {
+        case GPS_FIX_TYPE_NO_GPS:    return "NO_GPS";
+        case GPS_FIX_TYPE_NO_FIX:    return "NO_FIX";
+        case GPS_FIX_TYPE_2D_FIX:    return "2D_FIX";
+        case GPS_FIX_TYPE_3D_FIX:    return "3D_FIX";
+        case GPS_FIX_TYPE_DGPS:      return "DGPS";
+        case GPS_FIX_TYPE_RTK_FLOAT: return "RTK_FLOAT";
+        case GPS_FIX_TYPE_RTK_FIXED: return "RTK_FIXED";
+        case GPS_FIX_TYPE_STATIC:    return "STATIC";
+        case GPS_FIX_TYPE_PPP:       return "PPP";
+        default:                      return "UNKNOWN";
+    }
+}
 
 std::vector<Waypoint> mission;
 size_t currentWaypointIndex = 0;
 uint64_t missionStartTime = 0;
 bool missionStarted = false;
 bool armed = false;
+bool waitingForTakeoff = false;
+unsigned long takeoffStartTime = 0;
 
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -96,6 +153,11 @@ PubSubClient client(espClient);
 unsigned long lastTelemetryTime = 0;
 unsigned long lastGPSTime = 0;
 unsigned long lastStatusRequestTime = 0;
+bool waitingForMissionStart = false;
+
+uint32_t targetStartTimeSeconds = 0;
+float targetTakeoffAltitude = 0;
+unsigned long lastArmingCheck = -1;
 
 mavlink_message_t msg;
 mavlink_status_t status;
@@ -133,6 +195,7 @@ void setup() {
   Serial.begin(115200);
   pixhawkSerial.begin(57600, SERIAL_8N1, RX_PIN, TX_PIN);
   
+  setupLEDs();
   setup_wifi();
 
   client.setBufferSize(MQTT_MAX_PACKET_SIZE);
@@ -175,8 +238,21 @@ void loop() {
     handle_mavlink_message(&current_msg);
   }
 
+  // Check if we're waiting for mission start time
+  if (waitingForMissionStart) {
+    uint64_t currentTime = getCurrentTimeUsLite();
+    uint64_t currentSeconds = (currentTime / 1000000ULL) % 86400ULL;
+    
+    if (currentSeconds >= targetStartTimeSeconds) {
+      startMissionExecution();
+    }
+  }
+  if (waitingForTakeoff) {
+    missionTakeoff(targetTakeoffAltitude);
+  }
 
   executeMission();
+  executeLightSequence();
 
   // Send telemetry data at regular intervals
   unsigned long currentTime = millis();
@@ -444,8 +520,9 @@ void callback(char* topic, byte* payload, unsigned int length) {
             Serial.println("Going to else part");
           }
         } else if (command == "start_mission") {
-          float takeoffAltitude = doc["takeoffAltitude"].as<float>();
-          startMission(takeoffAltitude);
+          targetTakeoffAltitude = doc["takeoffAltitude"].as<float>();
+          targetStartTimeSeconds = doc["startTimeSeconds"].as<uint32_t>();
+          startMission();
         }
       }
     } else if (strcmp(topic, mqtt_rtcm_topic) == 0) {
@@ -542,6 +619,13 @@ void handle_mavlink_message(mavlink_message_t *msg) {
       // Update connection status
       publishStatus("connected");
       break;
+
+    case MAVLINK_MSG_ID_GPS_RAW_INT: 
+      mavlink_gps_raw_int_t gps_raw;
+      mavlink_msg_gps_raw_int_decode(msg, &gps_raw);
+      current_gps_fix_type = gps_raw.fix_type;
+      break;
+
     case MAVLINK_MSG_ID_GLOBAL_POSITION_INT:
       // Process global position
       mavlink_global_position_int_t global_pos;
@@ -574,6 +658,54 @@ void formatTimestamp(char* buffer, size_t bufferSize, uint64_t timestamp_us) {
     uint32_t seconds = timestamp_s % 60;
     
     snprintf(buffer, bufferSize, "%02d:%02d:%02d", hours, minutes, seconds);
+}
+
+
+// Replace the old setupLEDs() with this new version
+void setupLEDs() {
+    FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS)
+        .setCorrection(TypicalLEDStrip);
+    FastLED.setBrightness(BRIGHTNESS);
+    FastLED.clear();
+    FastLED.show();
+    Serial.println("LED strip initialized");
+}
+
+// Add this helper function to set all LEDs to the same color
+void setRGB(uint8_t red, uint8_t green, uint8_t blue) {
+    for(int i = 0; i < NUM_LEDS; i++) {
+        leds[i] = CRGB(red, green, blue);
+    }
+    FastLED.show();
+}
+
+void parseLightSequence(JsonArray& sequence) {
+    lightSequence.clear();
+    currentLightIndex = 0;
+    
+    for (JsonObject step : sequence) {
+        uint32_t time = step["time"];
+        uint8_t r = step["r"];
+        uint8_t g = step["g"];
+        uint8_t b = step["b"];
+        
+        lightSequence.push_back({
+            time * 1000ULL, // Convert to microseconds
+            r,
+            g,
+            b,
+            false
+        });
+        
+        Serial.printf("Added light step: time=%u, R=%u, G=%u, B=%u\n", 
+                     time, r, g, b);
+    }
+}
+
+// Add this function to turn off LEDs when mission ends or on errors
+void turnOffLEDs() {
+    FastLED.clear();
+    FastLED.show();
 }
 
 void printDebugInfo() {
@@ -637,6 +769,13 @@ void requestMAVLinkData() {
   mavlink_msg_command_long_pack(SYSTEM_ID, COMPONENT_ID, &msg, 1, 1, MAV_CMD_REQUEST_MESSAGE, 0, MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 0, 0, 0, 0, 0, 0);
   uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
   pixhawkSerial.write(buf, len);
+  
+  // Request GPS_RAW_INT
+  mavlink_msg_command_long_pack(SYSTEM_ID, COMPONENT_ID, &msg, 1, 1, 
+                                MAV_CMD_REQUEST_MESSAGE, 0, 
+                                MAVLINK_MSG_ID_GPS_RAW_INT, 0, 0, 0, 0, 0, 0);
+  len = mavlink_msg_to_send_buffer(buf, &msg);
+  pixhawkSerial.write(buf, len);
 
   // Request SYS_STATUS for battery info
   mavlink_msg_command_long_pack(SYSTEM_ID, COMPONENT_ID, &msg, 1, 1, MAV_CMD_REQUEST_MESSAGE, 0, MAVLINK_MSG_ID_SYS_STATUS, 0, 0, 0, 0, 0, 0);
@@ -652,12 +791,13 @@ void sendTelemetryData() {
   bool gotPosition = false;
   bool gotStatus = false;
   bool gotHeartbeat = false;
+  bool gotGPS = false;
   float altitude = 0;
   float battery_voltage = 0;
   uint8_t base_mode = 0;
   uint32_t custom_mode = 0;
 
-  while ((!gotPosition || !gotStatus || !gotHeartbeat) && (millis() - startTime < 1000)) {
+  while ((!gotPosition || !gotStatus || !gotHeartbeat || !gotGPS) && (millis() - startTime < 1000)) {
     if (pixhawkSerial.available()) {
       mavlink_message_t msg;
       mavlink_status_t status;
@@ -686,17 +826,26 @@ void sendTelemetryData() {
             gotHeartbeat = true;
             break;
           }
+          case MAVLINK_MSG_ID_GPS_RAW_INT: {
+            mavlink_gps_raw_int_t gps_raw;
+            mavlink_msg_gps_raw_int_decode(&msg, &gps_raw);
+            current_gps_fix_type = gps_raw.fix_type;
+            gotGPS = true;
+            break;
+          }
         }
       }
     }
   }
 
   const char* mode_str = getFlightModeString(base_mode, custom_mode);
+  const char* gps_fix_str = getGPSFixTypeString(current_gps_fix_type);
 
   DynamicJsonDocument doc(1024);
   doc["altitude"] = altitude;
   doc["battery"] = battery_voltage;
   doc["mode"] = mode_str;
+  doc["gps_fix"] = gps_fix_str;
   // Serial.println("Telemetry data: ALTITUDE");
   // Serial.print(altitude);
   // Serial.println("Telemetry data: Battery Voltage");
@@ -769,10 +918,20 @@ void handleMissionUpload(JsonDocument& doc) {
         }
         missionStarted = false;
         currentWaypointIndex = 0;
-        client.publish(mqtt_status_topic, "{\"status\": \"mission uploaded successfully\"}");
+        client.publish(mqtt_status_topic, "{\"status\": \"waypoint mission uploaded successfully\"}");
     } else {
         client.publish(mqtt_status_topic, "{\"status\": \"error: invalid mission data\"}");
     }
+
+    // Parse light sequence if available
+    if (doc.containsKey("light_sequence")) {
+      Serial.println("light sequesnce was present");
+        JsonArray lightSeq = doc["light_sequence"].as<JsonArray>();
+        parseLightSequence(lightSeq);
+        Serial.printf("Parsed %d light sequence steps\n", lightSequence.size());
+        client.publish(mqtt_status_topic, "{\"status\": \"leds mission uploaded successfully\"}");
+    }
+    currentLightIndex = 0;
     publishStatus("mission uploaded");
 }
 
@@ -787,32 +946,185 @@ void clearMission() {
   pixhawkSerial.write(buf, len);
 }
 
-void startMission(float takeoffAltitude) {
-  if (!mission.empty() && !missionStarted) {
-    // Arm the drone if not armed
-    if (!isArmed()) {
-      publishStatus("Drone not armed");
+void startMission() {
+    if (!mission.empty() && !missionStarted) {
+        uint64_t currentTime = getCurrentTimeUsLite();
+        uint64_t currentSeconds = (currentTime / 1000000ULL) % 86400ULL;
+        
+        if (targetStartTimeSeconds > currentSeconds) {
+            // Instead of waiting here, set flag and return
+            waitingForMissionStart = true;
+            Serial.printf("Will start mission at target time: ");
+            char timestamp[20];
+            formatTimestamp(timestamp, sizeof(timestamp), targetStartTimeSeconds * 1000000ULL);
+            Serial.printf("Will start mission at target time: %s\n", timestamp);
+            publishStatus("Waiting for start time");
+            return;
+        }
+        
+        // Actual mission start logic
+        startMissionExecution();
+    }
+}
+
+void startMissionExecution() {
+    
+    if (lastArmingCheck == -1) { // (!isArmed())
+        armDrone();
+        lastArmingCheck = millis(); // Reset telemetry timer
+        return; // Will continue in next loop iteration
     }
     
-    // Takeoff to specified altitude
-    // This should automatically switch to GUIDED mode if necessary
-    takeoff(takeoffAltitude);
-    
-    // Wait for altitude to be reached
-    unsigned long start = millis();
-    while (getCurrentAltitude() < takeoffAltitude * 0.95 && millis() - start < 10000) { // Wait up to 10 seconds
-      delay(500);
+    // Check if we just armed and need to wait 2 seconds
+    if (millis() - lastArmingCheck < 2000) {
+        return; // Will continue in next loop iteration
     }
     
+    waitingForMissionStart = false;
+    currentWaypointIndex = 0;
+    currentLightIndex = 0;
+    
+    // Reset executed flags for light sequence
+    for (auto& step : lightSequence) {
+        step.executed = false;
+    }
+    
+    // Clear any existing LED states
+    FastLED.clear();
+    FastLED.show();
+    // Start takeoff sequence
+    if (!waitingForTakeoff) {
+      missionTakeoff(targetTakeoffAltitude);
+    }
+    publishStatus("mission started");
+}
+
+void missionTakeoff(float altitude) {
+  static bool takeoffCommandSent = false;
+  
+  if (!waitingForTakeoff) {
+      // Initialize takeoff sequence
+      takeoffCommandSent = false;
+      waitingForTakeoff = true;
+      takeoffStartTime = millis();
+      return;
+  }
+
+  // Send takeoff command if not sent yet
+  if (!takeoffCommandSent) {
+      takeoff(altitude);
+      takeoffCommandSent = true;
+      publishStatus("Starting takeoff");
+      return;
+  }
+
+  // Check altitude progress
+  float currentAlt = getCurrentAltitude();
+  unsigned long elapsedTime = millis() - takeoffStartTime;
+
+  // Check if we've reached target altitude or timed out
+  if (currentAlt >= altitude * 0.95 || elapsedTime >= 10000) {
+    waitingForTakeoff = false;
+    
+    if (currentAlt >= altitude * 0.95) {
+        // Only now start the mission timing and enable mission execution
+        publishStatus("Reached target altitude, starting waypoint mission");
+    } else {
+        publishStatus("Takeoff timeout, starting mission");
+        // Optionally handle timeout case (land or hold position)
+        // land();
+    }
     missionStartTime = getCurrentTimeUsLite();
     missionStarted = true;
-    currentWaypointIndex = 0;
-    publishStatus("mission started");
-  } else {
-    publishStatus("Cannot start mission: Either mission is empty or already started");
+    // return;
+  }
+
+  // Still waiting for altitude...
+  if (elapsedTime % 1000 == 0) {  // Update status every second
+      char status[50];
+      snprintf(status, sizeof(status), "Takeoff in progress: %.1fm/%.1fm", currentAlt, altitude);
+      publishStatus(status);
   }
 }
 
+// void startMission(float takeoffAltitude, uint32_t targetStartTimeSeconds) {
+//   if (!mission.empty() && !missionStarted) {
+    
+//     uint64_t currentTime = getCurrentTimeUsLite();
+//     uint64_t currentSeconds = (currentTime / 1000000ULL) % 86400ULL; // Seconds since midnight
+//     Serial.println("targetStarteTime");
+//     Serial.println(targetStartTimeSeconds);
+//     Serial.println("CurrentTime");
+//     Serial.println(currentSeconds);
+//     Serial.println("=====");
+//     while(targetStartTimeSeconds > currentSeconds) {
+//       // // Wait until the target time
+//       // uint32_t delaySeconds = targetStartTimeSeconds - currentSeconds;
+//       currentTime = getCurrentTimeUsLite();
+//       currentSeconds = (currentTime / 1000000ULL) % 86400ULL;
+//       delay(1000);
+//     }
+//     // Arm the drone if not armed
+//     if (!isArmed()) {
+//       armDrone();
+//       delay(2000);
+//     }
+
+//     Serial.println("=aa--==");
+    
+//     // Takeoff to specified altitude
+//     // This should automatically switch to GUIDED mode if necessary
+//     takeoff(takeoffAltitude);
+    
+//     // Wait for altitude to be reached
+//     unsigned long start = millis();
+//     while (getCurrentAltitude() < takeoffAltitude * 0.95 && millis() - start < 10000) { // Wait up to 10 seconds
+//       delay(500);
+//     }
+    
+//     missionStartTime = getCurrentTimeUsLite();
+//     missionStarted = true;
+//     currentWaypointIndex = 0;
+//     currentLightIndex = 0;
+    
+//     // Reset executed flags for light sequence
+//     for (auto& step : lightSequence) {
+//         step.executed = false;
+//     }
+    
+//     // Clear any existing LED states
+//     FastLED.clear();
+//     FastLED.show();
+//     publishStatus("mission started");
+//   } else {
+//     publishStatus("Cannot start mission: Either mission is empty or already started");
+//   }
+// }
+
+void executeLightSequence() {
+    if (!missionStarted || lightSequence.empty()) return;
+    
+    uint64_t currentTime = getCurrentTimeUsLite();
+    uint64_t elapsedTime = currentTime - missionStartTime;
+    
+    // Find and execute all light steps that should be active
+    while (currentLightIndex < lightSequence.size() &&
+           elapsedTime >= lightSequence[currentLightIndex].time) {
+        
+        if (!lightSequence[currentLightIndex].executed) {
+            const LightStep& step = lightSequence[currentLightIndex];
+            
+            // Update LED values using FastLED
+            setRGB(step.r, step.g, step.b);
+            
+            Serial.printf("Updated lights: R=%u, G=%u, B=%u at time %llu\n",
+                         step.r, step.g, step.b, elapsedTime);
+            
+            lightSequence[currentLightIndex].executed = true;
+        }
+        currentLightIndex++;
+    }
+}
 
 void executeMission() {
     if (!missionStarted || mission.empty()) return;
