@@ -10,9 +10,11 @@
 #include <queue>
 #include <map>
 #include <FastLED.h>
+#include "esp_task_wdt.h"
+#include "esp_system.h"
 
 
-#define DRONE_ID 2
+#define DRONE_ID 4
 #define RX_PIN 16
 #define TX_PIN 18
 
@@ -21,7 +23,7 @@
 #define LED_TYPE    WS2812B
 #define COLOR_ORDER GRB
 #define BRIGHTNESS  255        // Default brightness (0-255)
-#define MAX_LIGHT_SEQUENCE 50
+#define MAX_LIGHT_SEQUENCE 7 //7*7 total 49
 
 // Add this with other global variable declarations
 CRGB leds[NUM_LEDS];
@@ -39,7 +41,7 @@ const unsigned long GPS_TIME_INTERVAL = 1000;
 const unsigned long STATUS_MESSAGE_INTERVAL = 1000;
 
 std::queue<mavlink_message_t> message_queue;
-const int MAX_QUEUE_SIZE = 20;
+const int MAX_STATUS_MESSAGE_QUEUE_SIZE  = 5;
 #define MQTT_MAX_PACKET_SIZE 2048
 
 
@@ -56,10 +58,14 @@ char mqtt_individual_command_topic[50];
 char mqtt_individual_status_topic[50];
 
 
-// GPS timing info
-unsigned long systemTimeAtLastGPSUpdate = 0;
-uint64_t last_gps_time_us = 0;
+uint64_t systemTimeOffset = 0;
 bool timeInitialized = false;
+
+RTC_NOINIT_ATTR int resetCount = 0;  // Survives reboots
+RTC_NOINIT_ATTR uint32_t lastResetTime = 0;
+
+bool telemetryStreamsInitialized = false;
+const unsigned long STREAM_REINIT_INTERVAL = 30000;
 
 // MAVLink IDs
 #define SYSTEM_ID 255
@@ -97,6 +103,36 @@ struct LightStep {
     bool executed;  // Flag to track if this step has been executed
 };
 
+enum CommandPriority {
+  PRIORITY_LOW,    // For RTCM messages
+  PRIORITY_HIGH    // For commands and navigation
+};
+
+struct CommandMessage {
+  mavlink_message_t msg;
+  unsigned long timestamp;
+  uint8_t retries;
+  bool requiresAck;
+  CommandPriority priority;
+};
+
+class CompareCommandPriority {
+public:
+    bool operator()(const CommandMessage& a, const CommandMessage& b) {
+        return a.priority < b.priority;
+    }
+};
+
+std::priority_queue<CommandMessage, std::vector<CommandMessage>, CompareCommandPriority> commandQueue;
+const size_t MAX_QUEUE_SIZE = 10;  // Increased to handle RTCM messages
+unsigned long lastCommandSentTime = 0;
+const unsigned long COMMAND_SPACING = 250;
+float current_altitude = 0.0f;
+float battery_voltage = 0.0f;
+uint8_t base_mode = 0;
+uint32_t custom_mode = 0;
+uint8_t current_satellites_visible = 0;
+uint8_t current_gps_fix_type = GPS_FIX_TYPE_NO_GPS;
 // Keep these global variables
 std::vector<LightStep> lightSequence;
 size_t currentLightIndex = 0;
@@ -118,25 +154,20 @@ size_t currentLightIndex = 0;
 #define GPS_FIX_TYPE_STATIC     7   // Static fixed
 #define GPS_FIX_TYPE_PPP        8   // PPP solution
 
-
-
-// Add this global variable to store GPS fix type
-uint8_t current_gps_fix_type = GPS_FIX_TYPE_NO_GPS;
-
 // Add this helper function to convert fix type to string
 const char* getGPSFixTypeString(uint8_t fix_type) {
-    switch(fix_type) {
-        case GPS_FIX_TYPE_NO_GPS:    return "NO_GPS";
-        case GPS_FIX_TYPE_NO_FIX:    return "NO_FIX";
-        case GPS_FIX_TYPE_2D_FIX:    return "2D_FIX";
-        case GPS_FIX_TYPE_3D_FIX:    return "3D_FIX";
-        case GPS_FIX_TYPE_DGPS:      return "DGPS";
-        case GPS_FIX_TYPE_RTK_FLOAT: return "RTK_FLOAT";
-        case GPS_FIX_TYPE_RTK_FIXED: return "RTK_FIXED";
-        case GPS_FIX_TYPE_STATIC:    return "STATIC";
-        case GPS_FIX_TYPE_PPP:       return "PPP";
-        default:                      return "UNKNOWN";
-    }
+  switch(fix_type) {
+    case GPS_FIX_TYPE_NO_GPS:    return "NO_GPS";
+    case GPS_FIX_TYPE_NO_FIX:    return "NO_FIX";
+    case GPS_FIX_TYPE_2D_FIX:    return "2D_FIX";
+    case GPS_FIX_TYPE_3D_FIX:    return "3D_FIX";
+    case GPS_FIX_TYPE_DGPS:      return "DGPS";
+    case GPS_FIX_TYPE_RTK_FLOAT: return "RTK_FLOAT";
+    case GPS_FIX_TYPE_RTK_FIXED: return "RTK_FIXED";
+    case GPS_FIX_TYPE_STATIC:    return "STATIC";
+    case GPS_FIX_TYPE_PPP:       return "PPP";
+    default:                      return "UNKNOWN";
+  }
 }
 
 std::vector<Waypoint> mission;
@@ -196,6 +227,8 @@ void setup() {
   pixhawkSerial.begin(57600, SERIAL_8N1, RX_PIN, TX_PIN);
   
   setupLEDs();
+  FastLED.clear();
+  FastLED.show();
   setup_wifi();
 
   client.setBufferSize(MQTT_MAX_PACKET_SIZE);
@@ -203,6 +236,49 @@ void setup() {
   client.setSocketTimeout(30);  // Increase socket timeout
   client.setServer(mqtt_server, 1883);
   client.setCallback(callback);
+  setupTelemetryStreams();
+  // Initialize watchdog
+  Serial.println("Initializing watchdog timer...");
+  esp_reset_reason_t resetReason = esp_reset_reason();
+  // Configure Watchdog timer
+  esp_task_wdt_config_t wdtConfig;
+  wdtConfig.timeout_ms = 10000;  // 30 seconds in milliseconds
+  wdtConfig.idle_core_mask = 0;  // Watch all cores
+  wdtConfig.trigger_panic = true;  // Force reset on timeout
+  // Update reset statistics
+  if (resetReason == ESP_RST_WDT || 
+    resetReason == ESP_RST_BROWNOUT || 
+    resetReason == ESP_RST_PANIC) {
+    resetCount++;
+    
+    // Log reset event
+    char msg[100];
+    snprintf(msg, sizeof(msg), "Reset #%d detected! Reason: ", resetCount);
+    
+    switch(resetReason) {
+      case ESP_RST_WDT:
+          strcat(msg, "Watchdog");
+          break;
+      case ESP_RST_BROWNOUT:
+          strcat(msg, "Brownout");
+          break;
+      case ESP_RST_PANIC:
+          strcat(msg, "Panic");
+          break;
+      default:
+          strcat(msg, "Other");
+    }
+    
+    Serial.println(msg);
+    if (client.connected()) {
+        addStatusMessage(msg);
+        publishStatus(msg);
+        changeFlightMode(LAND_MODE);
+    }
+  }
+
+  esp_task_wdt_init(&wdtConfig);
+  esp_task_wdt_add(NULL);
   
   delay(1000);
   
@@ -216,6 +292,8 @@ void setup() {
 }
 
 void loop() {
+  esp_task_wdt_reset();
+
   if (!client.connected()) {
     if (reconnect()) {
       lastReconnectAttempt = 0;
@@ -226,7 +304,7 @@ void loop() {
   while (pixhawkSerial.available()) {
     uint8_t c = pixhawkSerial.read();
     if (mavlink_parse_char(MAVLINK_COMM_0, c, &msg, &status)) {
-      if (message_queue.size() < MAX_QUEUE_SIZE) {
+      if (message_queue.size() < MAX_STATUS_MESSAGE_QUEUE_SIZE ) {
         message_queue.push(msg);
       }
     }
@@ -251,25 +329,16 @@ void loop() {
     missionTakeoff(targetTakeoffAltitude);
   }
 
+  handlePreMissionBlink();
   executeMission();
   executeLightSequence();
-
+  processCommandQueue();
   // Send telemetry data at regular intervals
   unsigned long currentTime = millis();
- 
-  // if (currentTime - lastStatusRequestTime > STATUS_MESSAGE_INTERVAL) { 
-  //   requestStatusMessages();
-  //   lastStatusRequestTime = currentTime;
-  // }
+
   if (currentTime - lastTelemetryTime >= TELEMETRY_INTERVAL) {
     sendTelemetryData();
     lastTelemetryTime = currentTime;
-    // printDebugInfo();
-  }
-  currentTime = millis();
-  if (currentTime - lastGPSTime >= GPS_TIME_INTERVAL) {
-    getCurrentTimeUs();
-    lastGPSTime = currentTime;
   }
 }
 
@@ -320,39 +389,37 @@ boolean reconnect() {
   }
 }
 
-bool waitForAck(uint8_t expectedMsgId, unsigned long timeout) {
-    auto start = std::chrono::high_resolution_clock::now();
-    while (true) {
-        if (pixhawkSerial.available()) {
-            mavlink_message_t msg;
-            mavlink_status_t status;
-            uint8_t c = pixhawkSerial.read();
-            if (mavlink_parse_char(MAVLINK_COMM_0, c, &msg, &status)) {
-                // Serial.print("Received message ID: ");
-                // Serial.println(msg.msgid);
-                if (msg.msgid == expectedMsgId || msg.msgid == MAVLINK_MSG_ID_MISSION_REQUEST || msg.msgid == MAVLINK_MSG_ID_MISSION_ACK) {
-                    if (msg.msgid == MAVLINK_MSG_ID_MISSION_ACK) {
-                        mavlink_mission_ack_t ack;
-                        mavlink_msg_mission_ack_decode(&msg, &ack);
-                        Serial.print("Mission ACK type: ");
-                        Serial.println(ack.type);
-                        if (ack.type != MAV_MISSION_ACCEPTED) {
-                            Serial.print("Mission command not accepted. Error: ");
-                            Serial.println(ack.type);
-                            return false;
-                        }
-                    }
-                    return true;
-                }
-            }
-        }
-        auto now = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
-        if (duration.count() > timeout) {
-            Serial.println("Timeout waiting for ACK");
+
+
+bool queueCommand(mavlink_message_t& msg, bool requiresAck, bool isRTCM = false) {
+    if (commandQueue.size() >= MAX_QUEUE_SIZE) {
+        if (isRTCM) {
+            // For RTCM messages, we can drop them if queue is full
+            Serial.println("Queue full, dropping RTCM message");
             return false;
         }
+        // For high priority commands, clear any low priority messages
+        std::priority_queue<CommandMessage, std::vector<CommandMessage>, CompareCommandPriority> tempQueue;
+        while (!commandQueue.empty()) {
+            CommandMessage cmd = commandQueue.top();
+            commandQueue.pop();
+            if (cmd.priority == PRIORITY_HIGH) {
+                tempQueue.push(cmd);
+            }
+        }
+        commandQueue = tempQueue;
     }
+
+    CommandMessage cmd = {
+        .msg = msg,
+        .timestamp = millis(),
+        .retries = 0,
+        .requiresAck = requiresAck,
+        .priority = isRTCM ? PRIORITY_LOW : PRIORITY_HIGH
+    };
+    
+    commandQueue.push(cmd);
+    return true;
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
@@ -523,6 +590,8 @@ void callback(char* topic, byte* payload, unsigned int length) {
           targetTakeoffAltitude = doc["takeoffAltitude"].as<float>();
           targetStartTimeSeconds = doc["startTimeSeconds"].as<uint32_t>();
           startMission();
+        } else if (command == "time_sync" && !timeInitialized) {
+          handleTimeSync(doc);
         }
       }
     } else if (strcmp(topic, mqtt_rtcm_topic) == 0) {
@@ -564,8 +633,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
             &buffer[i]             // Pointer to start of this chunk
         );
         
-        uint16_t len = mavlink_msg_to_send_buffer(mavBuffer, &msg);
-        pixhawkSerial.write(mavBuffer, len);
+        queueCommand(msg, false, true);  // RTCM messages are low priority
         
         // Log chunk information
         Serial.print("Sent chunk ");
@@ -610,13 +678,21 @@ void checkMissionTimeout() {
 }
 
 void handle_mavlink_message(mavlink_message_t *msg) {
+  if (!commandQueue.empty() && commandQueue.top().requiresAck) {
+    if (msg->msgid == MAVLINK_MSG_ID_MISSION_ACK || 
+        msg->msgid == MAVLINK_MSG_ID_COMMAND_ACK) {
+      commandQueue.pop();
+      lastCommandSentTime = millis();
+    }
+  }
+  
   switch (msg->msgid) {
     case MAVLINK_MSG_ID_HEARTBEAT:
-      // Process heartbeat
       mavlink_heartbeat_t heartbeat;
       mavlink_msg_heartbeat_decode(msg, &heartbeat);
       armed = (heartbeat.base_mode & MAV_MODE_FLAG_SAFETY_ARMED);
-      // Update connection status
+      base_mode = heartbeat.base_mode;
+      custom_mode = heartbeat.custom_mode;
       publishStatus("connected");
       break;
 
@@ -624,31 +700,81 @@ void handle_mavlink_message(mavlink_message_t *msg) {
       mavlink_gps_raw_int_t gps_raw;
       mavlink_msg_gps_raw_int_decode(msg, &gps_raw);
       current_gps_fix_type = gps_raw.fix_type;
+      current_satellites_visible = gps_raw.satellites_visible;
       break;
 
     case MAVLINK_MSG_ID_GLOBAL_POSITION_INT:
-      // Process global position
       mavlink_global_position_int_t global_pos;
       mavlink_msg_global_position_int_decode(msg, &global_pos);
-      // Update position in telemetry data
+      current_altitude = global_pos.relative_alt / 1000.0f;
       break;
+
     case MAVLINK_MSG_ID_SYS_STATUS:
-      // Process system status
       mavlink_sys_status_t sys_status;
       mavlink_msg_sys_status_decode(msg, &sys_status);
-      // Update battery status in telemetry data
+      battery_voltage = sys_status.voltage_battery / 1000.0f;
       break;
+
     case MAVLINK_MSG_ID_STATUSTEXT: {
       mavlink_statustext_t statustext;
       mavlink_msg_statustext_decode(msg, &statustext);
-      Serial.println(statustext.text);
       addStatusMessage(statustext.text);
       break;
     }
-    // Add more message handlers as needed
   }
 }
 
+
+void processCommandQueue() {
+  if (commandQueue.empty()) {
+      return;
+  }
+
+  unsigned long currentTime = millis();
+  if (currentTime - lastCommandSentTime < COMMAND_SPACING) {
+      return;
+  }
+
+  CommandMessage cmd = commandQueue.top();
+  
+  // Check for timeout
+  if (currentTime - cmd.timestamp > 2000) {  // 2 second timeout
+      if (cmd.requiresAck && cmd.retries < 3 && cmd.priority == PRIORITY_HIGH) {
+          // Only retry high priority commands
+          uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+          uint16_t len = mavlink_msg_to_send_buffer(buf, &cmd.msg);
+          pixhawkSerial.write(buf, len);
+          lastCommandSentTime = currentTime;
+          
+          // Update and requeue the command
+          cmd.timestamp = currentTime;
+          cmd.retries++;
+          commandQueue.pop();
+          commandQueue.push(cmd);
+          
+          Serial.printf("Retrying high priority command, attempt %d/3\n", cmd.retries + 1);
+      } else {
+          // Drop the command if:
+          // - Max retries reached for high priority
+          // - Low priority command timed out (no retries)
+          // - Non-ACK command timed out
+          Serial.printf("Dropping %s priority command\n", 
+                        cmd.priority == PRIORITY_HIGH ? "high" : "low");
+          commandQueue.pop();
+      }
+      return;
+  }
+
+  // Send the command
+  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+  uint16_t len = mavlink_msg_to_send_buffer(buf, &cmd.msg);
+  pixhawkSerial.write(buf, len);
+  lastCommandSentTime = currentTime;
+
+  if (!cmd.requiresAck) {
+      commandQueue.pop();
+  }
+}
 
 // Helper function to format timestamp
 void formatTimestamp(char* buffer, size_t bufferSize, uint64_t timestamp_us) {
@@ -708,20 +834,6 @@ void turnOffLEDs() {
     FastLED.show();
 }
 
-void printDebugInfo() {
-  static unsigned long lastDebugTime = 0;
-  if (millis() - lastDebugTime > 5000) { // Print every 5 seconds
-    Serial.println("Debug Info:");
-    Serial.print("Messages in queue: ");
-    Serial.println(message_queue.size());
-    Serial.print("Status messages stored: ");
-    Serial.println(statusMessages.size());
-    Serial.print("Last known armed state: ");
-    Serial.println(armed ? "ARMED" : "DISARMED");
-    lastDebugTime = millis();
-  }
-}
-
 // Add this new function to handle status messages
 void addStatusMessage(const char* message) {
     char timestamp[20];
@@ -742,16 +854,6 @@ void addStatusMessage(const char* message) {
     client.publish(mqtt_individual_status_topic, mqttMessage);
 }
 
-// Add this new function to request status messages
-void requestStatusMessages() {
-  mavlink_message_t msg;
-  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-
-  mavlink_msg_command_long_pack(SYSTEM_ID, COMPONENT_ID, &msg, 1, 1, MAV_CMD_REQUEST_MESSAGE, 0, MAVLINK_MSG_ID_STATUSTEXT, 0, 0, 0, 0, 0, 0);
-  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-  pixhawkSerial.write(buf, len);
-}
-
 
 void publishStatus(const char* status) {
   DynamicJsonDocument doc(256);
@@ -761,97 +863,54 @@ void publishStatus(const char* status) {
   client.publish(mqtt_status_topic, buffer);
 }
 
-void requestMAVLinkData() {
+void setupTelemetryStreams() {
   mavlink_message_t msg;
-  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-
-  // Request GLOBAL_POSITION_INT
-  mavlink_msg_command_long_pack(SYSTEM_ID, COMPONENT_ID, &msg, 1, 1, MAV_CMD_REQUEST_MESSAGE, 0, MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 0, 0, 0, 0, 0, 0);
-  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-  pixhawkSerial.write(buf, len);
   
-  // Request GPS_RAW_INT
-  mavlink_msg_command_long_pack(SYSTEM_ID, COMPONENT_ID, &msg, 1, 1, 
-                                MAV_CMD_REQUEST_MESSAGE, 0, 
-                                MAVLINK_MSG_ID_GPS_RAW_INT, 0, 0, 0, 0, 0, 0);
-  len = mavlink_msg_to_send_buffer(buf, &msg);
-  pixhawkSerial.write(buf, len);
+  // Position data at 2Hz (includes GPS, global & local position)
+  mavlink_msg_request_data_stream_pack(
+      SYSTEM_ID, COMPONENT_ID, &msg,
+      1, 1,
+      MAV_DATA_STREAM_POSITION,
+      2,     // 2 Hz
+      1      // Start
+  );
+  queueCommand(msg, false, false);
+    
+  // Extended status data at 2Hz (includes SYS_STATUS)
+  mavlink_msg_request_data_stream_pack(
+      SYSTEM_ID, COMPONENT_ID, &msg,
+      1, 1,
+      MAV_DATA_STREAM_EXTENDED_STATUS,
+      2,     // 2 Hz
+      1
+  );
+  queueCommand(msg, false, false);
+  
+  // Extra data at 2Hz (includes GPS_RAW)
+  mavlink_msg_request_data_stream_pack(
+      SYSTEM_ID, COMPONENT_ID, &msg,
+      1, 1,
+      MAV_DATA_STREAM_EXTRA1,
+      2,     // 2 Hz
+      1
+  );
+  queueCommand(msg, false, false);
 
-  // Request SYS_STATUS for battery info
-  mavlink_msg_command_long_pack(SYSTEM_ID, COMPONENT_ID, &msg, 1, 1, MAV_CMD_REQUEST_MESSAGE, 0, MAVLINK_MSG_ID_SYS_STATUS, 0, 0, 0, 0, 0, 0);
-  len = mavlink_msg_to_send_buffer(buf, &msg);
-  pixhawkSerial.write(buf, len);
+  telemetryStreamsInitialized = true;
 }
 
 
 void sendTelemetryData() {
-  requestMAVLinkData();
-
-  unsigned long startTime = millis();
-  bool gotPosition = false;
-  bool gotStatus = false;
-  bool gotHeartbeat = false;
-  bool gotGPS = false;
-  float altitude = 0;
-  float battery_voltage = 0;
-  uint8_t base_mode = 0;
-  uint32_t custom_mode = 0;
-
-  while ((!gotPosition || !gotStatus || !gotHeartbeat || !gotGPS) && (millis() - startTime < 1000)) {
-    if (pixhawkSerial.available()) {
-      mavlink_message_t msg;
-      mavlink_status_t status;
-      uint8_t c = pixhawkSerial.read();
-      if (mavlink_parse_char(MAVLINK_COMM_0, c, &msg, &status)) {
-        switch (msg.msgid) {
-          case MAVLINK_MSG_ID_GLOBAL_POSITION_INT: {
-            mavlink_global_position_int_t pos;
-            mavlink_msg_global_position_int_decode(&msg, &pos);
-            altitude = pos.relative_alt / 1000.0f;
-            gotPosition = true;
-            break;
-          }
-          case MAVLINK_MSG_ID_SYS_STATUS: {
-            mavlink_sys_status_t sys_status;
-            mavlink_msg_sys_status_decode(&msg, &sys_status);
-            battery_voltage = sys_status.voltage_battery / 1000.0f;
-            gotStatus = true;
-            break;
-          }
-          case MAVLINK_MSG_ID_HEARTBEAT: {
-            mavlink_heartbeat_t heartbeat;
-            mavlink_msg_heartbeat_decode(&msg, &heartbeat);
-            base_mode = heartbeat.base_mode;
-            custom_mode = heartbeat.custom_mode;
-            gotHeartbeat = true;
-            break;
-          }
-          case MAVLINK_MSG_ID_GPS_RAW_INT: {
-            mavlink_gps_raw_int_t gps_raw;
-            mavlink_msg_gps_raw_int_decode(&msg, &gps_raw);
-            current_gps_fix_type = gps_raw.fix_type;
-            gotGPS = true;
-            break;
-          }
-        }
-      }
-    }
-  }
-
+  // Use the global variables that are updated by handle_mavlink_message
   const char* mode_str = getFlightModeString(base_mode, custom_mode);
   const char* gps_fix_str = getGPSFixTypeString(current_gps_fix_type);
 
   DynamicJsonDocument doc(1024);
-  doc["altitude"] = altitude;
-  doc["battery"] = battery_voltage;
+  doc["altitude"] = current_altitude;  // Using global variable
+  doc["battery"] = battery_voltage;    // Add this as a global variable
   doc["mode"] = mode_str;
   doc["gps_fix"] = gps_fix_str;
-  // Serial.println("Telemetry data: ALTITUDE");
-  // Serial.print(altitude);
-  // Serial.println("Telemetry data: Battery Voltage");
-  // Serial.print(battery_voltage);
-  // Serial.println("Telemetry data: Mode");
-  // Serial.print(mode_str);
+  doc["satellites_visible"] = current_satellites_visible;  // Using global variable
   
   if (timeInitialized) {
     doc["timestamp"] = getCurrentTimeUsLite();
@@ -936,16 +995,6 @@ void handleMissionUpload(JsonDocument& doc) {
 }
 
 
-void clearMission() {
-  mavlink_message_t msg;
-  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-
-  mavlink_msg_mission_clear_all_pack(SYSTEM_ID, COMPONENT_ID, &msg, 1, 1);
-  
-  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-  pixhawkSerial.write(buf, len);
-}
-
 void startMission() {
     if (!mission.empty() && !missionStarted) {
         uint64_t currentTime = getCurrentTimeUsLite();
@@ -1019,7 +1068,7 @@ void missionTakeoff(float altitude) {
   }
 
   // Check altitude progress
-  float currentAlt = getCurrentAltitude();
+  float currentAlt = current_altitude;
   unsigned long elapsedTime = millis() - takeoffStartTime;
 
   // Check if we've reached target altitude or timed out
@@ -1047,59 +1096,23 @@ void missionTakeoff(float altitude) {
   }
 }
 
-// void startMission(float takeoffAltitude, uint32_t targetStartTimeSeconds) {
-//   if (!mission.empty() && !missionStarted) {
+void handlePreMissionBlink() {
+    if (missionStarted) return;  // Don't run if mission has started
     
-//     uint64_t currentTime = getCurrentTimeUsLite();
-//     uint64_t currentSeconds = (currentTime / 1000000ULL) % 86400ULL; // Seconds since midnight
-//     Serial.println("targetStarteTime");
-//     Serial.println(targetStartTimeSeconds);
-//     Serial.println("CurrentTime");
-//     Serial.println(currentSeconds);
-//     Serial.println("=====");
-//     while(targetStartTimeSeconds > currentSeconds) {
-//       // // Wait until the target time
-//       // uint32_t delaySeconds = targetStartTimeSeconds - currentSeconds;
-//       currentTime = getCurrentTimeUsLite();
-//       currentSeconds = (currentTime / 1000000ULL) % 86400ULL;
-//       delay(1000);
-//     }
-//     // Arm the drone if not armed
-//     if (!isArmed()) {
-//       armDrone();
-//       delay(2000);
-//     }
-
-//     Serial.println("=aa--==");
+    // Get current second using getCurrentTimeUsLite()
+    uint64_t currentTimeUs = getCurrentTimeUsLite();
+    uint64_t currentSecond = (currentTimeUs / 1000000ULL) % 86400ULL;  // Seconds since midnight
     
-//     // Takeoff to specified altitude
-//     // This should automatically switch to GUIDED mode if necessary
-//     takeoff(takeoffAltitude);
-    
-//     // Wait for altitude to be reached
-//     unsigned long start = millis();
-//     while (getCurrentAltitude() < takeoffAltitude * 0.95 && millis() - start < 10000) { // Wait up to 10 seconds
-//       delay(500);
-//     }
-    
-//     missionStartTime = getCurrentTimeUsLite();
-//     missionStarted = true;
-//     currentWaypointIndex = 0;
-//     currentLightIndex = 0;
-    
-//     // Reset executed flags for light sequence
-//     for (auto& step : lightSequence) {
-//         step.executed = false;
-//     }
-    
-//     // Clear any existing LED states
-//     FastLED.clear();
-//     FastLED.show();
-//     publishStatus("mission started");
-//   } else {
-//     publishStatus("Cannot start mission: Either mission is empty or already started");
-//   }
-// }
+    // Turn on white for even seconds, off for odd seconds
+    if (currentSecond % 2 == 0) {
+        // Set white color (R=255, G=255, B=255)
+        setRGB(255, 255, 255);
+    } else {
+        // Turn off LEDs
+        FastLED.clear();
+        FastLED.show();
+    }
+}
 
 void executeLightSequence() {
     if (!missionStarted || lightSequence.empty()) return;
@@ -1146,141 +1159,102 @@ void executeMission() {
         }
     } else {
         // Mission complete
-        land();
+        changeFlightMode(LAND_MODE);
         missionStarted = false;
         publishStatus("mission completed");
     }
 }
 
 void navigateToWaypoint(const Waypoint& waypoint) {
-    // Implement navigation logic here
-    mavlink_message_t msg;
-    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-
-    mavlink_msg_mission_item_int_pack(SYSTEM_ID, COMPONENT_ID, &msg,
-                                      1, 1, 0, MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-                                      MAV_CMD_NAV_WAYPOINT,
-                                      2, 0, 0, 0, 0, 0,
-                                      waypoint.lat * 1e7, waypoint.lon * 1e7, waypoint.alt);
-    uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-    pixhawkSerial.write(buf, len);
-
+  // Implement navigation logic here
+  mavlink_message_t msg;
+  mavlink_msg_mission_item_int_pack(SYSTEM_ID, COMPONENT_ID, &msg,
+                                    1, 1, 0, MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                                    MAV_CMD_NAV_WAYPOINT,
+                                    2, 0, 0, 0, 0, 0,
+                                    waypoint.lat * 1e7, waypoint.lon * 1e7, waypoint.alt);
+  if (queueCommand(msg, true, false)) {  // High priority
     char status_message[100];
-    snprintf(status_message, sizeof(status_message), "Navigating to waypoint %d: Lat %.6f, Lon %.6f, Alt %.2f", 
-             currentWaypointIndex, waypoint.lat, waypoint.lon, waypoint.alt);
+    snprintf(status_message, sizeof(status_message), 
+            "Queued waypoint %d: Lat %.6f, Lon %.6f, Alt %.2f", 
+            currentWaypointIndex, waypoint.lat, waypoint.lon, waypoint.alt);
     publishStatus(status_message);
+  }
+
+  char status_message[100];
+  snprintf(status_message, sizeof(status_message), "Navigating to waypoint %d: Lat %.6f, Lon %.6f, Alt %.2f", 
+            currentWaypointIndex, waypoint.lat, waypoint.lon, waypoint.alt);
+  publishStatus(status_message);
 }
 
 void changeFlightMode(uint8_t mode) {
   mavlink_message_t msg;
-  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-
   mavlink_msg_set_mode_pack(SYSTEM_ID, COMPONENT_ID, &msg, 1, MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, mode);
   
-  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-  pixhawkSerial.write(buf, len);
+  if (queueCommand(msg, true, false)) {  // false for non-critical
+    const char* mode_str = getFlightModeString(MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, mode);
+    char status_message[50];
+    snprintf(status_message, sizeof(status_message), "Queued mode change to %s", mode_str);
+    publishStatus(status_message);
+    Serial.println(status_message);
+  };
+}
 
-  const char* mode_str;
-  auto it = flightModes.find(mode);
-  if (it != flightModes.end()) {
-      mode_str = it->second;
-  } else {
-      mode_str = "UNKNOWN";
+// Simplified function to handle time sync message from GCS
+void handleTimeSync(const JsonDocument& doc) {
+  if (!doc.containsKey("timestamp") || timeInitialized) {
+      return; // Ignore if already initialized or invalid message
   }
-
-  char status_message[50];
-  snprintf(status_message, sizeof(status_message), "Mode changed to %s", mode_str);
+  
+  uint64_t gcsTime = doc["timestamp"].as<uint64_t>();
+  systemTimeOffset = gcsTime - micros();
+  timeInitialized = true;
+  
+  char status_message[100];
+  snprintf(status_message, sizeof(status_message), "Time synchronized with offset=%llu", systemTimeOffset);
   publishStatus(status_message);
-  Serial.println(status_message);
-}
-
-
-void handle_gps_time(const mavlink_system_time_t& sys_time) {
-  if (!timeInitialized || sys_time.time_unix_usec > last_gps_time_us) {
-    last_gps_time_us = sys_time.time_unix_usec;
-    systemTimeAtLastGPSUpdate = micros();
-    timeInitialized = true;
-    // Serial.println("Time reference updated from GPS");
-    // Serial.print("GPS Unix time (us): ");
-    // Serial.println(last_gps_time_us);
-    // Serial.print("System time at update (ms): ");
-    // Serial.println(systemTimeAtLastGPSUpdate);
-  }
-}
-
-uint64_t getCurrentTimeUs() {
-  mavlink_message_t msg;
-  mavlink_status_t status;
-  
-  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-  mavlink_msg_command_long_pack(SYSTEM_ID, COMPONENT_ID, &msg, 1, 1, MAV_CMD_REQUEST_MESSAGE, 0, MAVLINK_MSG_ID_SYSTEM_TIME, 0, 0, 0, 0, 0, 0);
-  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-  pixhawkSerial.write(buf, len);
-  
-  unsigned long start = millis();
-  while (millis() - start < 1000) {
-    if (pixhawkSerial.available()) {
-      uint8_t c = pixhawkSerial.read();
-      if (mavlink_parse_char(MAVLINK_COMM_0, c, &msg, &status)) {
-        if (msg.msgid == MAVLINK_MSG_ID_SYSTEM_TIME) {
-          mavlink_system_time_t sys_time;
-          mavlink_msg_system_time_decode(&msg, &sys_time);
-          handle_gps_time(sys_time);
-          return sys_time.time_unix_usec;
-        }
-      }
-    }
-  }
-  
-  if (timeInitialized) {
-    uint64_t time_since_last_gps = (uint64_t)(micros() - systemTimeAtLastGPSUpdate);
-    return last_gps_time_us + time_since_last_gps;
-  }
-  
-  return (uint64_t)micros();
 }
 
 //Give absolute time without mavlink call, based on last gps call
 uint64_t getCurrentTimeUsLite() {
   if (!timeInitialized) {
-      return (uint64_t)micros();
-  }
-  uint64_t time_since_last_gps = (uint64_t)(micros() - systemTimeAtLastGPSUpdate);
-  return last_gps_time_us + time_since_last_gps;
+        return micros();
+    }
+  return micros() + systemTimeOffset;
 }
 
-bool isArmed() {
-    // Request a HEARTBEAT message
-    mavlink_message_t msg;
-    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+// bool isArmed() { // change for queueCommand if requried
+//     // Request a HEARTBEAT message
+//     mavlink_message_t msg;
+//     uint8_t buf[MAVLINK_MAX_PACKET_LEN];
     
-    mavlink_msg_command_long_pack(SYSTEM_ID, COMPONENT_ID, &msg,
-                                  1, 1, // target system, target component
-                                  MAV_CMD_REQUEST_MESSAGE, 0, // command, confirmation
-                                  MAVLINK_MSG_ID_HEARTBEAT, 0, 0, 0, 0, 0, 0); // params
+//     mavlink_msg_command_long_pack(SYSTEM_ID, COMPONENT_ID, &msg,
+//                                   1, 1, // target system, target component
+//                                   MAV_CMD_REQUEST_MESSAGE, 0, // command, confirmation
+//                                   MAVLINK_MSG_ID_HEARTBEAT, 0, 0, 0, 0, 0, 0); // params
     
-    uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-    pixhawkSerial.write(buf, len);
+//     uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+//     pixhawkSerial.write(buf, len);
     
-    // Wait for a short time to receive the HEARTBEAT
-    unsigned long start = millis();
-    while (millis() - start < 1000) { // Wait up to 1 second
-        if (pixhawkSerial.available()) {
-            uint8_t c = pixhawkSerial.read();
-            if (mavlink_parse_char(MAVLINK_COMM_0, c, &msg, &status)) {
-                if (msg.msgid == MAVLINK_MSG_ID_HEARTBEAT) {
-                    mavlink_heartbeat_t heartbeat;
-                    mavlink_msg_heartbeat_decode(&msg, &heartbeat);
-                    armed = (heartbeat.base_mode & MAV_MODE_FLAG_SAFETY_ARMED);
-                    return armed;
-                }
-            }
-        }
-    }
+//     // Wait for a short time to receive the HEARTBEAT
+//     unsigned long start = millis();
+//     while (millis() - start < 1000) { // Wait up to 1 second
+//         if (pixhawkSerial.available()) {
+//             uint8_t c = pixhawkSerial.read();
+//             if (mavlink_parse_char(MAVLINK_COMM_0, c, &msg, &status)) {
+//                 if (msg.msgid == MAVLINK_MSG_ID_HEARTBEAT) {
+//                     mavlink_heartbeat_t heartbeat;
+//                     mavlink_msg_heartbeat_decode(&msg, &heartbeat);
+//                     armed = (heartbeat.base_mode & MAV_MODE_FLAG_SAFETY_ARMED);
+//                     return armed;
+//                 }
+//             }
+//         }
+//     }
     
-    // If we didn't receive a new HEARTBEAT, return the last known arm status
-    return armed;
-}
+//     // If we didn't receive a new HEARTBEAT, return the last known arm status
+//     return armed;
+// }
 
 void armDrone() {
   mavlink_message_t msg;
@@ -1288,11 +1262,10 @@ void armDrone() {
 
   mavlink_msg_command_long_pack(SYSTEM_ID, COMPONENT_ID, &msg, 1, 1, MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0);
   
-  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-  pixhawkSerial.write(buf, len);
-
-  publishStatus("Sent arm command");
-  Serial.println("Sent arm command");
+  if (queueCommand(msg, true, false)) {  // High priority, needs ACK
+    publishStatus("Queued arm command");
+    Serial.println("Queued arm command");
+  }
 }
 
 void takeoff(float altitude) {
@@ -1301,58 +1274,10 @@ void takeoff(float altitude) {
 
   mavlink_msg_command_long_pack(SYSTEM_ID, COMPONENT_ID, &msg, 1, 1, MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, 0, altitude);
   
-  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-  pixhawkSerial.write(buf, len);
-
-  publishStatus("Sent takeoff command");
-  Serial.println("Sent takeoff command");
-}
-
-void land() {
-  Serial.println("landing");
-  mavlink_message_t msg;
-  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-
-  mavlink_msg_command_long_pack(SYSTEM_ID, COMPONENT_ID, &msg, 1, 1, MAV_CMD_NAV_LAND, 0, 0, 0, 0, 0, 0, 0, 0);
-  
-  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-  pixhawkSerial.write(buf, len);
-  publishStatus("Sent land command");
-  Serial.println("Sent land command");
-}
-
-float getCurrentAltitude() {
-    float altitude = 0.0f;
-    // Request a GLOBAL_POSITION_INT message
-    mavlink_message_t msg;
-    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-    
-    mavlink_msg_command_long_pack(SYSTEM_ID, COMPONENT_ID, &msg,
-                                  1, 1, // target system, target component
-                                  MAV_CMD_REQUEST_MESSAGE, 0, // command, confirmation
-                                  MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 0, 0, 0, 0, 0, 0); // params
-    
-    uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-    pixhawkSerial.write(buf, len);
-    
-    // Wait for a short time to receive the GLOBAL_POSITION_INT
-    unsigned long start = millis();
-    while (millis() - start < 1000) { // Wait up to 1 second
-        if (pixhawkSerial.available()) {
-            uint8_t c = pixhawkSerial.read();
-            if (mavlink_parse_char(MAVLINK_COMM_0, c, &msg, &status)) {
-                if (msg.msgid == MAVLINK_MSG_ID_GLOBAL_POSITION_INT) {
-                    mavlink_global_position_int_t global_pos;
-                    mavlink_msg_global_position_int_decode(&msg, &global_pos);
-                    altitude = global_pos.relative_alt / 1000.0f; // Convert from mm to m
-                    return altitude;
-                }
-            }
-        }
-    }
-    
-    // If we didn't receive a new GLOBAL_POSITION_INT, return the default altitude (0)
-    return altitude;
+  if (queueCommand(msg, true, false)) {  // High priority, needs ACK
+    publishStatus("Queued takeoff command");
+    Serial.println("Queued takeoff command");
+  }
 }
 
 // Add this helper function to print the free heap memory
