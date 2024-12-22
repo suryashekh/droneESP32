@@ -16,6 +16,7 @@
 #define RX_PIN 16
 #define TX_PIN 18
 
+#define MAX_LIGHT_STEPS 2000  // Increased from default to handle larger sequences
 #define LED_PIN 13   // GPIO2 for ESP32
 #define NUM_LEDS 49  // Number of LEDs in your strip
 #define LED_TYPE WS2812B
@@ -65,6 +66,8 @@ RTC_NOINIT_ATTR uint32_t lastResetTime = 0;
 bool telemetryStreamsInitialized = false;
 const unsigned long STREAM_REINIT_INTERVAL = 30000;
 
+unsigned long lastMissionExecutionTime = 0;
+const unsigned long MISSION_EXECUTION_INTERVAL = 100; // Check mission every 100ms
 // MAVLink IDs
 #define SYSTEM_ID 255
 #define COMPONENT_ID MAV_COMP_ID_MISSIONPLANNER
@@ -148,11 +151,21 @@ uint32_t custom_mode = 0;
 uint8_t current_satellites_visible = 0;
 uint8_t current_gps_fix_type = GPS_FIX_TYPE_NO_GPS;
 // Keep these global variables
-std::vector<LightStep> lightSequence;
+// std::vector<LightStep> lightSequence;
+struct LightSequenceManager {
+    LightStep steps[MAX_LIGHT_STEPS];
+    size_t count;
+    size_t currentIndex;
+};
+
+// Replace the global vector with our new structure
+LightSequenceManager lightSequence;
 size_t currentLightIndex = 0;
 // Add these global variables at the top with other global declarations
 bool missionCancelled = false;
 unsigned long missionCancelTime = 0;
+bool isLightSequenceOnly = false;
+
 
 #define MAX_WAYPOINTS 150
 #define MAX_MISSION_SIZE (MAX_WAYPOINTS * sizeof(Waypoint))
@@ -247,6 +260,21 @@ unsigned long lastArmingCheck = -1;
 mavlink_message_t msg;
 mavlink_status_t status;
 
+enum ConnectionState {
+    DISCONNECTED,
+    CONNECTING_WIFI,
+    CONNECTING_MQTT,
+    CONNECTED
+};
+
+const unsigned long MQTT_ATTEMPT_TIMEOUT = 1000;  // 1 second timeout for MQTT connection attempt
+unsigned long mqttAttemptStart = 0;
+
+ConnectionState connectionState = DISCONNECTED;
+unsigned long connectionStartTime = 0;
+const unsigned long CONNECTION_TIMEOUT = 5000; // 5 second timeout for connection attempts
+
+
 const std::map<uint8_t, const char*> flightModes = {
   { 0, "STABILIZE" },
   { 1, "ACRO" },
@@ -304,13 +332,20 @@ void setup() {
 }
 
 void loop() {
+  unsigned long currentMillis = millis();
 
-  if (!client.connected()) {
-    if (connect()) {
-      lastReconnectAttempt = 0;
-    }
+  // Handle mission execution independently of MQTT connection
+  if (currentMillis - lastMissionExecutionTime >= MISSION_EXECUTION_INTERVAL) {
+    handleMissionExecution();
+    lastMissionExecutionTime = currentMillis;
   }
-  client.loop();
+
+  handleConnection();
+
+  // Only run client.loop() if connected
+  if (connectionState == CONNECTED) {
+      client.loop();
+  }
 
   checkDroneComms();
   
@@ -374,36 +409,90 @@ void setup_wifi() {
   Serial.println("IP address: " + WiFi.localIP().toString());
 }
 
-// Replace your existing reconnect() with this connect() function
-boolean connect() {
-    if (millis() - lastReconnectAttempt < RECONNECT_INTERVAL) {
-        return false;
-    }
+void handleConnection() {
+  static unsigned long lastAttempt = 0;
+  unsigned long currentMillis = millis();
 
-    lastReconnectAttempt = millis();
-    
-    String clientId = "ESP32Client_";
-    clientId += String(DRONE_ID);
-    clientId += "_";
-    clientId += String(random(0xffff), HEX);
+  // Only attempt reconnection after RECONNECT_INTERVAL
+  if (currentMillis - lastAttempt < RECONNECT_INTERVAL) {
+      return;
+  }
 
-    Serial.print("Attempting MQTT connection...");
-    
-    // Connect with clean session and shorter keepalive
-    if (client.connect(clientId.c_str())) {
-        Serial.println("connected");
-        client.subscribe(mqtt_command_topic);
-        client.subscribe(mqtt_mission_topic);
-        client.subscribe(mqtt_individual_command_topic);
-        client.subscribe(mqtt_rtcm_topic);
-        publishStatus("connected");
-        return true;
-    } else {
-        Serial.print("failed, rc=");
-        Serial.print(client.state());
-        Serial.println(" try again after interval");
-        return false;
-    }
+  // Check for connection timeout
+  if ((connectionState == CONNECTING_WIFI || connectionState == CONNECTING_MQTT) &&
+      (currentMillis - connectionStartTime > CONNECTION_TIMEOUT)) {
+      connectionState = DISCONNECTED;
+      Serial.println("Connection attempt timed out");
+  }
+
+  switch (connectionState) {
+      case DISCONNECTED:
+          if (WiFi.status() != WL_CONNECTED) {
+              Serial.println("Connecting to WiFi...");
+              WiFi.begin(ssid, password);
+              connectionState = CONNECTING_WIFI;
+              connectionStartTime = currentMillis;
+              lastAttempt = currentMillis;
+          } else if (!client.connected()) {
+              connectionState = CONNECTING_MQTT;
+              connectionStartTime = currentMillis;
+              mqttAttemptStart = currentMillis;  // Start MQTT connection timer
+          }
+          break;
+
+      case CONNECTING_WIFI:
+          if (WiFi.status() == WL_CONNECTED) {
+              Serial.println("WiFi connected");
+              Serial.println("IP address: " + WiFi.localIP().toString());
+              connectionState = CONNECTING_MQTT;
+              connectionStartTime = currentMillis;
+              mqttAttemptStart = currentMillis;  // Start MQTT connection timer
+          }
+          break;
+
+      case CONNECTING_MQTT:
+          if (!client.connected()) {
+              // Only attempt MQTT connection if we haven't started or previous attempt timed out
+              if (currentMillis - mqttAttemptStart >= MQTT_ATTEMPT_TIMEOUT) {
+                  String clientId = "ESP32Client_";
+                  clientId += String(DRONE_ID);
+                  clientId += "_";
+                  clientId += String(random(0xffff), HEX);
+
+                  Serial.print("Attempting MQTT connection...");
+                  
+                  // Set shorter socket timeout for connection attempt
+                  client.setSocketTimeout(1);  // 1 second socket timeout
+                  
+                  if (client.connect(clientId.c_str())) {
+                      Serial.println("connected");
+                      client.setSocketTimeout(15);  // Reset to normal timeout
+                      // Subscribe to topics
+                      client.subscribe(mqtt_command_topic);
+                      client.subscribe(mqtt_mission_topic);
+                      client.subscribe(mqtt_individual_command_topic);
+                      client.subscribe(mqtt_rtcm_topic);
+                      publishStatus("connected");
+                      connectionState = CONNECTED;
+                  } else {
+                      Serial.print("failed, rc=");
+                      Serial.print(client.state());
+                      Serial.println(" try again after interval");
+                      connectionState = DISCONNECTED;
+                      lastAttempt = currentMillis;
+                  }
+                  mqttAttemptStart = currentMillis;  // Reset timer for next attempt
+              }
+          }
+          break;
+
+      case CONNECTED:
+          if (WiFi.status() != WL_CONNECTED || !client.connected()) {
+              connectionState = DISCONNECTED;
+              Serial.println("Connection lost");
+          }
+          break;
+  }
 }
 
 void checkDroneComms() {
@@ -524,15 +613,31 @@ void callback(char* topic, byte* payload, unsigned int length) {
       return;
     }
 
-    if (!chunkDoc.containsKey("chunk") || !chunkDoc.containsKey("totalChunks") || !chunkDoc.containsKey("totalSize") || !chunkDoc.containsKey("data")) {
+    // Reset the flag at the start of new mission upload (chunk 0)
+    if (chunkDoc["chunk"]["chunk"] == 0) {
+        isLightSequenceOnly = false;  // Reset at start of new mission
+        Serial.println("Reset light sequence flag");
+    }
+
+    if (chunkDoc.containsKey("light_sequence_only")) {
+      isLightSequenceOnly = chunkDoc["light_sequence_only"];
+      publishStatus("Starting new mission upload");
+      Serial.printf("Light sequence only mode: %s\n", isLightSequenceOnly ? "true" : "false");
+    }
+
+    if (!chunkDoc.containsKey("chunk") || 
+      !chunkDoc["chunk"].containsKey("chunk") || 
+      !chunkDoc["chunk"].containsKey("totalChunks") || 
+      !chunkDoc["chunk"].containsKey("totalSize") || 
+      !chunkDoc["chunk"].containsKey("data")) {
       Serial.println("Invalid chunk format");
       return;
     }
 
-    int chunk = chunkDoc["chunk"];
-    int totalChunks = chunkDoc["totalChunks"];
-    size_t totalSize = chunkDoc["totalSize"];
-    const char* data = chunkDoc["data"];
+    int chunk = chunkDoc["chunk"]["chunk"];
+    int totalChunks = chunkDoc["chunk"]["totalChunks"];
+    size_t totalSize = chunkDoc["chunk"]["totalSize"];
+    const char* data = chunkDoc["chunk"]["data"];
     size_t dataSize = strlen(data);
 
     Serial.printf("Received chunk %d of %d, size: %d\n",
@@ -609,7 +714,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
           printHeapStats();
 
           // Process complete mission
-          DynamicJsonDocument missionDoc(16384);
+          DynamicJsonDocument missionDoc(65536);
           error = deserializeJson(missionDoc, missionBuffer.buffer);
 
           if (error) {
@@ -760,6 +865,33 @@ void checkMissionTimeout() {
   }
 }
 
+// New function to handle all mission-related execution
+void handleMissionExecution() {
+  // Check if we're waiting for mission start time
+  if (waitingForMissionStart && !missionCancelled) {
+    uint64_t currentTime = getCurrentTimeUsLite();
+    uint64_t currentSeconds = (currentTime / 1000000ULL) % 86400ULL;
+
+    if (currentSeconds >= targetStartTimeSeconds) {
+      startMissionExecution();
+    }
+  }
+
+  // Handle mission takeoff
+  if (waitingForTakeoff) {
+    missionTakeoff(targetTakeoffAltitude);
+  }
+
+  // Handle pre-mission blinking
+  handlePreMissionBlink();
+  
+  // Execute mission components regardless of connection status
+  if (!missionCancelled) {
+    executeMission();
+    executeLightSequence();
+  }
+}
+
 void handle_mavlink_message(mavlink_message_t* msg) {
 
   commMonitor.lastMavlinkMsg = millis();
@@ -906,26 +1038,45 @@ void setRGB(uint8_t red, uint8_t green, uint8_t blue) {
 }
 
 void parseLightSequence(JsonArray& sequence) {
-  lightSequence.clear();
-  currentLightIndex = 0;
+    // Reset the sequence
+    lightSequence.count = 0;
+    lightSequence.currentIndex = 0;
+    
+    size_t stepCount = 0;
+    for (JsonObject step : sequence) {
+        if (stepCount >= MAX_LIGHT_STEPS) {
+            Serial.printf("Warning: Light sequence truncated at %d steps\n", MAX_LIGHT_STEPS);
+            break;
+        }
+        
+        uint32_t time = step["time"];
+        uint8_t r = step["r"];
+        uint8_t g = step["g"];
+        uint8_t b = step["b"];
 
-  for (JsonObject step : sequence) {
-    uint32_t time = step["time"];
-    uint8_t r = step["r"];
-    uint8_t g = step["g"];
-    uint8_t b = step["b"];
-
-    lightSequence.push_back({ time * 1000ULL,  // Convert to microseconds
-                              r,
-                              g,
-                              b,
-                              false });
-
-    Serial.printf("Added light step: time=%u, R=%u, G=%u, B=%u\n",
-                  time, r, g, b);
-  }
+        lightSequence.steps[stepCount] = {
+            .time = time * 1000ULL,  // Convert to microseconds
+            .r = r,
+            .g = g,
+            .b = b,
+            .executed = false
+        };
+        
+        Serial.printf("Added light step %d: time=%u, R=%u, G=%u, B=%u\n",
+                     stepCount, time, r, g, b);
+        
+        stepCount++;
+        
+        // Add a small delay every 100 steps to prevent watchdog issues
+        if (stepCount % 100 == 0) {
+            delay(1);
+            yield();
+        }
+    }
+    
+    lightSequence.count = stepCount;
+    Serial.printf("Successfully loaded %d light steps\n", stepCount);
 }
-
 // Add this function to turn off LEDs when mission ends or on errors
 void turnOffLEDs() {
   FastLED.clear();
@@ -1064,10 +1215,10 @@ void handleMissionUpload(JsonDocument& doc) {
   Serial.println("\nProcessing mission upload");
 
   // Print the raw JSON for debugging
-  String jsonStr;
-  serializeJson(doc, jsonStr);
-  Serial.println("Received JSON:");
-  Serial.println(jsonStr);
+  // String jsonStr;
+  // serializeJson(doc, jsonStr);
+  // Serial.println("Received JSON:");
+  // Serial.println(jsonStr);
 
   // Check if the document is an array
   JsonArray waypoints;
@@ -1084,8 +1235,8 @@ void handleMissionUpload(JsonDocument& doc) {
     return;
   }
 
-  Serial.printf("Number of waypoints: %d\n", waypoints.size());
-  if (waypoints.size() > 0) {
+  Serial.printf("Number of waypoints: %d\n, lighsequenceonly: %d", waypoints.size(),isLightSequenceOnly );
+  if (isLightSequenceOnly || waypoints.size() > 0) {
     mission.clear();
     int waypointIndex = 0;
     for (JsonObject waypoint : waypoints) {
@@ -1103,7 +1254,9 @@ void handleMissionUpload(JsonDocument& doc) {
   } else {
     client.publish(mqtt_status_topic, "{\"status\": \"error: invalid mission data\"}");
     publishStatus("error: invalid mission data");
+    Serial.println("Error: Invalid mission format");
     clearMissionData();
+    return;
   }
 
   // Parse light sequence if available
@@ -1111,7 +1264,7 @@ void handleMissionUpload(JsonDocument& doc) {
     Serial.println("light sequesnce was present");
     JsonArray lightSeq = doc["light_sequence"].as<JsonArray>();
     parseLightSequence(lightSeq);
-    Serial.printf("Parsed %d light sequence steps\n", lightSequence.size());
+    Serial.printf("Parsed %d light sequence steps\n", lightSequence.count);
     client.publish(mqtt_status_topic, "{\"status\": \"leds mission uploaded successfully\"}");
   }
   currentLightIndex = 0;
@@ -1120,7 +1273,7 @@ void handleMissionUpload(JsonDocument& doc) {
 
 
 void startMission() {
-  if (!mission.empty() && !missionStarted) {
+  if (isLightSequenceOnly || (!mission.empty() && !missionStarted)) {
     uint64_t currentTime = getCurrentTimeUsLite();
     uint64_t currentSeconds = (currentTime / 1000000ULL) % 86400ULL;
 
@@ -1146,8 +1299,9 @@ void clearMissionData() {
   currentWaypointIndex = 0;
 
   // Clear light sequence
-  lightSequence.clear();
-  currentLightIndex = 0;
+  // Clear light sequence
+  lightSequence.count = 0;
+  lightSequence.currentIndex = 0;
 
   // Reset mission states
   missionStarted = false;
@@ -1202,7 +1356,6 @@ void startMissionExecution() {
 
     switch (startupState) {
         case INIT:
-            // Always change to GUIDED mode
             changeFlightMode(GUIDED_MODE);
             stateStartTime = currentTime;
             startupState = MODE_CHANGE_WAIT;
@@ -1210,7 +1363,6 @@ void startMissionExecution() {
             break;
 
         case MODE_CHANGE_WAIT:
-            // Wait 500ms after mode change
             if (currentTime - stateStartTime >= 500) {
                 startupState = ARMING_WAIT;
                 stateStartTime = currentTime;
@@ -1220,78 +1372,79 @@ void startMissionExecution() {
             break;
 
         case ARMING_WAIT:
-            // Wait 1 second after arming command
             if (currentTime - stateStartTime >= 1000) {
                 startupState = TAKING_OFF;
-                
-                // Initialize mission parameters
-                waitingForMissionStart = false;
                 currentWaypointIndex = 0;
                 currentLightIndex = 0;
 
                 // Reset light sequence
-                for (auto& step : lightSequence) {
-                    step.executed = false;
+                for (size_t i = 0; i < lightSequence.count; i++) {
+                    lightSequence.steps[i].executed = false;
                 }
 
                 // Clear LEDs
                 FastLED.clear();
                 FastLED.show();
 
-                // Start takeoff
                 waitingForTakeoff = true;
                 missionTakeoff(targetTakeoffAltitude);
-                publishStatus("starting takeoff sequence");
+                publishStatus("starting takeoff");
             }
             break;
 
         case TAKING_OFF:
-            // Already handled by missionTakeoff() above
+            // Only start mission after takeoff is complete
+            if (!waitingForTakeoff) {
+                waitingForMissionStart = false;
+                missionStartTime = getCurrentTimeUsLite();
+                missionStarted = true;
+                publishStatus("takeoff complete, starting waypoint navigation");
+                startupState = INIT;  // Reset for next time
+            }
             break;
     }
 }
 
 void missionTakeoff(float altitude) {
-  static bool takeoffCommandSent = false;
+    static bool takeoffCommandSent = false;
 
-  // Send takeoff command if not sent yet
-  if (!takeoffCommandSent) {
-    takeoff(altitude);
-    takeoffCommandSent = true;
-    takeoffStartTime = millis(); // Move this here since we're starting the takeoff
-    publishStatus("Sending takeoff command");
-    return;
-  }
-
-  // Check altitude progress
-  float currentAlt = current_altitude;
-  unsigned long elapsedTime = millis() - takeoffStartTime;
-
-  // Check if we've reached target altitude or timed out
-  if (currentAlt >= altitude * 0.95 || elapsedTime >= 10000) {
-    waitingForTakeoff = false;
-    startupState = INIT;
-
-    if (currentAlt >= altitude * 0.95) {
-      // Only now start the mission timing and enable mission execution
-      takeoffCommandSent = false; // Reset for potential future takeoffs
-      publishStatus("Reached target altitude, starting waypoint mission");
-    } else {
-      publishStatus("Takeoff timeout, starting mission");
-      // Optionally handle timeout case (land or hold position)
-      // land();
+    // Send takeoff command if not sent yet
+    if (!takeoffCommandSent) {
+        takeoff(altitude);
+        takeoffCommandSent = true;
+        takeoffStartTime = millis();
+        publishStatus("Sending takeoff command");
+        return;
     }
-    missionStartTime = getCurrentTimeUsLite();
-    missionStarted = true;
-    // return;
-  }
 
-  // Still waiting for altitude...
-  if (elapsedTime % 1000 == 0) {  // Update status every second
-    char status[50];
-    snprintf(status, sizeof(status), "Takeoff in progress: %.1fm/%.1fm", currentAlt, altitude);
-    publishStatus(status);
-  }
+    // Check altitude progress
+    float currentAlt = current_altitude;
+    unsigned long elapsedTime = millis() - takeoffStartTime;
+
+    // Check if we've reached target altitude or timed out
+    if (currentAlt >= altitude * 0.95 || elapsedTime >= 10000) {
+        waitingForTakeoff = false;
+        takeoffCommandSent = false; // Reset for potential future takeoffs
+
+        if (currentAlt >= altitude * 0.95) {
+            publishStatus("Reached target altitude, starting mission");
+            // Important: Don't set missionStarted here
+            startupState = INIT;  // Reset state machine for next time
+            // Let startMissionExecution handle the mission start
+        } else {
+            publishStatus("Takeoff timeout");
+            // handleMissionCancel();  // Cancel mission on timeout
+            return;
+        }
+    } else {
+        // Still waiting for altitude...
+        if (elapsedTime % 1000 == 0) {  // Update status every second
+            char status[50];
+            snprintf(status, sizeof(status), "Takeoff in progress: %.1fm/%.1fm", currentAlt, altitude);
+            publishStatus(status);
+        }
+        return;  // Important: return while still taking off
+    }
 }
 
 void handlePreMissionBlink() {
@@ -1313,75 +1466,99 @@ void handlePreMissionBlink() {
 }
 
 void executeLightSequence() {
-  if (!missionStarted || lightSequence.empty() || missionCancelled) return;
+    if (!missionStarted || lightSequence.count == 0 || missionCancelled) return;
 
-  uint64_t currentTime = getCurrentTimeUsLite();
-  uint64_t elapsedTime = currentTime - missionStartTime;
+    uint64_t currentTime = getCurrentTimeUsLite();
+    uint64_t elapsedTime = currentTime - missionStartTime;
 
-  // Find and execute all light steps that should be active
-  while (currentLightIndex < lightSequence.size() && elapsedTime >= lightSequence[currentLightIndex].time) {
+    // Find and execute all light steps that should be active
+    while (lightSequence.currentIndex < lightSequence.count && 
+           elapsedTime >= lightSequence.steps[lightSequence.currentIndex].time) {
+        
+        if (!lightSequence.steps[lightSequence.currentIndex].executed) {
+            const LightStep& step = lightSequence.steps[lightSequence.currentIndex];
+            
+            // Update LED values using FastLED
+            setRGB(step.r, step.g, step.b);
 
-    if (!lightSequence[currentLightIndex].executed) {
-      const LightStep& step = lightSequence[currentLightIndex];
+            Serial.printf("Updated lights: R=%u, G=%u, B=%u at time %llu\n",
+                        step.r, step.g, step.b, elapsedTime);
 
-      // Update LED values using FastLED
-      setRGB(step.r, step.g, step.b);
-
-      Serial.printf("Updated lights: R=%u, G=%u, B=%u at time %llu\n",
-                    step.r, step.g, step.b, elapsedTime);
-
-      lightSequence[currentLightIndex].executed = true;
+            lightSequence.steps[lightSequence.currentIndex].executed = true;
+        }
+        lightSequence.currentIndex++;
     }
-    currentLightIndex++;
-  }
 }
 
+// Modify the executeMission() function to be more resilient
 void executeMission() {
   if (!missionStarted || mission.empty() || missionCancelled) return;
 
   uint64_t currentTime = getCurrentTimeUsLite();
   uint64_t elapsedTime = currentTime - missionStartTime;
 
-  // Find the next unvisited waypoint based on elapsed time
-  while (currentWaypointIndex < mission.size() - 1 && elapsedTime >= mission[currentWaypointIndex + 1].time) {
-    currentWaypointIndex++;
+  // Don't start navigation until we reach the time of the first waypoint
+  if (elapsedTime < mission[0].time) {
+    if (!mission[0].visited) {
+      char status_message[100];
+      snprintf(status_message, sizeof(status_message), 
+               "Waiting for first waypoint: %.1f seconds remaining", 
+               (mission[0].time - elapsedTime) / 1000000.0);
+      publishStatus(status_message);
+    }
+    return;
   }
 
-  if (currentWaypointIndex < mission.size()) {
-    Waypoint& currentWaypoint = mission[currentWaypointIndex];
-    if (!currentWaypoint.visited) {
+  // Find the target waypoint based on elapsed time
+  size_t targetIndex = currentWaypointIndex;
+  while (targetIndex < mission.size() - 1 && elapsedTime >= mission[targetIndex + 1].time) {
+    targetIndex++;
+  }
+
+  // Only update waypoint if we've moved to a new one
+  if (targetIndex != currentWaypointIndex) {
+    currentWaypointIndex = targetIndex;
+    if (currentWaypointIndex < mission.size()) {
+      Waypoint& currentWaypoint = mission[currentWaypointIndex];
       navigateToWaypoint(currentWaypoint);
       currentWaypoint.visited = true;
+      
+      // Try to publish status if connected, but don't block if disconnected
+      char status_message[100];
+       snprintf(status_message, sizeof(status_message),
+               "Navigating to waypoint %d at time %llu",
+               currentWaypointIndex, 
+               currentWaypoint.time / 1000); // Convert to seconds
+      
+      publishStatus(status_message);
+
+    } else {
+      // Mission complete
+      changeFlightMode(LAND_MODE);
+      missionStarted = false;
+      if (client.connected()) {
+        publishStatus("mission completed");
+      }
     }
-  } else {
-    // Mission complete
-    changeFlightMode(LAND_MODE);
-    missionStarted = false;
-    publishStatus("mission completed");
   }
 }
 
+
+// Modify the navigateToWaypoint function to be more resilient
 void navigateToWaypoint(const Waypoint& waypoint) {
-  // Implement navigation logic here
   mavlink_message_t msg;
   mavlink_msg_mission_item_int_pack(SYSTEM_ID, COMPONENT_ID, &msg,
-                                    1, 1, 0, MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-                                    MAV_CMD_NAV_WAYPOINT,
-                                    2, 0, 0, 0, 0, 0,
-                                    waypoint.lat * 1e7, waypoint.lon * 1e7, waypoint.alt);
-  if (queueCommand(msg, true, false)) {  // High priority
-    char status_message[100];
-    snprintf(status_message, sizeof(status_message),
-             "Queued waypoint %d: Lat %.6f, Lon %.6f, Alt %.2f",
-             currentWaypointIndex, waypoint.lat, waypoint.lon, waypoint.alt);
-    publishStatus(status_message);
-  }
+                                   1, 1, 0, MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                                   MAV_CMD_NAV_WAYPOINT,
+                                   2, 0, 0, 0, 0, 0,
+                                   waypoint.lat * 1e7, waypoint.lon * 1e7, waypoint.alt);
+  
+  // Always queue the command regardless of connection status
+  queueCommand(msg, true, false);
 
-  char status_message[100];
-  snprintf(status_message, sizeof(status_message), "Navigating to waypoint %d: Lat %.6f, Lon %.6f, Alt %.2f",
-           currentWaypointIndex, waypoint.lat, waypoint.lon, waypoint.alt);
-  Serial.println(status_message);
-  publishStatus(status_message);
+  // Log locally even if we can't publish
+  Serial.printf("Navigating to waypoint %d: Lat %.6f, Lon %.6f, Alt %.2f\n",
+                currentWaypointIndex, waypoint.lat, waypoint.lon, waypoint.alt);
 }
 
 void changeFlightMode(uint8_t mode) {
