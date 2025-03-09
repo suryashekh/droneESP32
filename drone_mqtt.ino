@@ -12,7 +12,7 @@
 #include <FastLED.h>
 
 
-#define DRONE_ID 1
+#define DRONE_ID 10
 #define RX_PIN 16
 #define TX_PIN 18
 
@@ -191,6 +191,8 @@ struct PositionAccuracy {
   uint32_t last_rtcm_time = 0;
   uint8_t fix_type = 0;
   uint8_t satellites = 0;
+  double latitude = 0.0; 
+  double longitude = 0.0; 
 
 
   String getFixTypeString() {
@@ -384,7 +386,6 @@ void loop() {
   }
 
   handlePreMissionBlink();
-  executeMission();
   executeLightSequence();
   processCommandQueue();
   setupTelemetryStreams();
@@ -877,10 +878,6 @@ void handleMissionExecution() {
     }
   }
 
-  // Handle mission takeoff
-  if (waitingForTakeoff) {
-    missionTakeoff(targetTakeoffAltitude);
-  }
 
   // Handle pre-mission blinking
   handlePreMissionBlink();
@@ -932,6 +929,8 @@ void handle_mavlink_message(mavlink_message_t* msg) {
       if (gps_raw.epv != UINT16_MAX) {
         posAccuracy.vertical_accuracy = gps_raw.epv / 100.0f;
       }
+      posAccuracy.latitude = gps_raw.lat / 1e7;
+      posAccuracy.longitude = gps_raw.lon / 1e7;
       break;
 
     case MAVLINK_MSG_ID_GLOBAL_POSITION_INT:
@@ -1169,6 +1168,8 @@ void sendTelemetryData() {
   doc["mode"] = mode_str;
   doc["gps_fix"] = posAccuracy.getFixTypeString();
   doc["satellites_visible"] = posAccuracy.satellites;
+  doc["latitude"] = posAccuracy.latitude;
+  doc["longitude"] = posAccuracy.longitude;
 
   // Add accuracy information
   JsonObject accuracy = doc.createNestedObject("accuracy");
@@ -1176,7 +1177,6 @@ void sendTelemetryData() {
   accuracy["horizontal"] = posAccuracy.horizontal_accuracy;
   accuracy["vertical"] = posAccuracy.vertical_accuracy;
   accuracy["rtcm_age"] = (millis() - posAccuracy.last_rtcm_time) / 1000.0f;
-
   if (timeInitialized) {
     doc["timestamp"] = getCurrentTimeUsLite();
   } else {
@@ -1334,6 +1334,7 @@ void handleMissionCancel() {
   // Clear all mission-related states
   currentWaypointIndex = 0;
   currentLightIndex = 0;
+  startupState = INIT; 
 
   // Turn off LEDs
   FastLED.clear();
@@ -1351,7 +1352,7 @@ void startMissionExecution() {
     if (missionCancelled) {
         return;
     }
-
+    // Serial.printf("Mission state=%d\n",startupState);
     unsigned long currentTime = millis();
 
     switch (startupState) {
@@ -1399,7 +1400,7 @@ void startMissionExecution() {
                 missionStartTime = getCurrentTimeUsLite();
                 missionStarted = true;
                 publishStatus("takeoff complete, starting waypoint navigation");
-                startupState = INIT;  // Reset for next time
+                // startupState = INIT;  // Reset for next time
             }
             break;
     }
@@ -1429,7 +1430,7 @@ void missionTakeoff(float altitude) {
         if (currentAlt >= altitude * 0.95) {
             publishStatus("Reached target altitude, starting mission");
             // Important: Don't set missionStarted here
-            startupState = INIT;  // Reset state machine for next time
+            // startupState = INIT;  // Reset state machine for next time
             // Let startMissionExecution handle the mission start
         } else {
             publishStatus("Takeoff timeout");
@@ -1509,6 +1510,33 @@ void executeMission() {
     return;
   }
 
+  // Special case for the first waypoint - if it hasn't been visited yet
+  if (!mission[0].visited) {
+      if (elapsedTime >= mission[0].time) {
+          navigateToWaypoint(mission[0]);
+          mission[0].visited = true;
+          currentWaypointIndex = 0;
+          
+          char status_message[100];
+          snprintf(status_message, sizeof(status_message),
+                  "Navigating to first waypoint at time %llu",
+                  mission[0].time / 1000);
+          publishStatus(status_message);
+          return;
+      }
+      return;  // Still waiting for first waypoint time
+  }
+
+  // // Check if we're at the last waypoint and it's been visited - initiate landing
+  // if (currentWaypointIndex == mission.size() - 1 && mission[currentWaypointIndex].visited) {
+  //     // Mission complete
+  //     changeFlightMode(LAND_MODE);
+  //     missionStarted = false;
+  //     if (client.connected()) {
+  //         publishStatus("mission completed, initiating landing");
+  //     }
+  //     return;
+  // }
   // Find the target waypoint based on elapsed time
   size_t targetIndex = currentWaypointIndex;
   while (targetIndex < mission.size() - 1 && elapsedTime >= mission[targetIndex + 1].time) {
@@ -1518,7 +1546,6 @@ void executeMission() {
   // Only update waypoint if we've moved to a new one
   if (targetIndex != currentWaypointIndex) {
     currentWaypointIndex = targetIndex;
-    if (currentWaypointIndex < mission.size()) {
       Waypoint& currentWaypoint = mission[currentWaypointIndex];
       navigateToWaypoint(currentWaypoint);
       currentWaypoint.visited = true;
@@ -1531,15 +1558,6 @@ void executeMission() {
                currentWaypoint.time / 1000); // Convert to seconds
       
       publishStatus(status_message);
-
-    } else {
-      // Mission complete
-      changeFlightMode(LAND_MODE);
-      missionStarted = false;
-      if (client.connected()) {
-        publishStatus("mission completed");
-      }
-    }
   }
 }
 
